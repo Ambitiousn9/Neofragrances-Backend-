@@ -12,6 +12,7 @@ const { CURRENCY, PricingError, toCedis, priceCart, signSnapshot, readSignedSnap
 const maintenanceSettings = require("./settings");
 const accounts = require("./accounts");
 const { createRateLimiter, createLoginThrottle } = require("./rate-limit");
+const { securityHeaders } = require("./security-headers");
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 
 if (!GOOGLE_CLIENT_ID) {
@@ -26,6 +27,12 @@ const app = express();
 // X-Forwarded-For header so req.ip reflects the real client IP. This
 // matters for the password-reset rate limiter below.
 app.set("trust proxy", 1);
+
+// Security headers (security-headers.js) go on before anything else can respond:
+// CORS preflights, malformed-JSON rejections, the maintenance guard, rate limits,
+// routes and the default 404 handler all inherit them.
+app.disable("x-powered-by");
+app.use(securityHeaders);
 
 // Explicit origin allowlist — never "*", because these APIs carry bearer tokens and
 // payment calls. CORS_ORIGINS holds a comma-separated list (the production Netlify

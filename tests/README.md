@@ -1,18 +1,18 @@
 # Local regression suites
 
-Eighteen standalone Node scripts (no test framework). Each starts its **own**
+Nineteen standalone Node scripts (no test framework). Each starts its **own**
 `server.js` on a private port, runs its checks, then deletes every fixture it
 created and restores stock. They all refuse to run unless the database is local.
-The exception is `auth-rate-limit-tests.js`, which never touches a database at all
-(see its row below).
+The exceptions are `auth-rate-limit-tests.js` and `security-headers-tests.js`, which
+never touch a database at all (see their rows below).
 
 **Run the whole set, not just the eight in the table's original form.** The table
-below lists all eighteen; `platform-tests.js`, `offers-behaviour.js`,
+below lists all nineteen; `platform-tests.js`, `offers-behaviour.js`,
 `maintenance-tests.js`, `account-controls-tests.js`,
 `order-status-history-tests.js`, `offers-multi-product-tests.js`,
 `scent-family-tests.js`, `scent-family-admin-e2e.js`,
-`scent-family-storefront-e2e.js` and `auth-rate-limit-tests.js` were added after the
-original eight and are easy to miss.
+`scent-family-storefront-e2e.js`, `auth-rate-limit-tests.js` and
+`security-headers-tests.js` were added after the original eight and are easy to miss.
 
 Full regression, last complete run: **925/925** across all fourteen suites
 (2026-10-09, Milestone 6 Phase 6E), with `offers-multi-product-tests.js` passing
@@ -58,6 +58,7 @@ Previously: **614/614** (2026-10-04), across eleven suites, before
 | `scent-family-admin-e2e.js` | Scent families admin page (Stage B), in headless Edge: nav registration, the five tiles against real counts, search + family / unassigned / stock filters, 30-per-page pagination, single assign / reassign / unassign with Undo and the in-flight state (no duplicate request), an archived-elsewhere product, bulk assign through the confirmation (exact ids + family on the wire), cancel, the 100-product cap, a refused bulk request with no false success, expired session and non-admin, the existing product editor keeping the family, 390px / 1366px. Never touches real products | 5076 | 9346 | 47/47 (focused run, 2026-10-10) |
 | `scent-family-storefront-e2e.js` | Shop by Scent Family storefront (Stage C2), in headless Edge: each family filter returns only its products (case-normalised, URL kept, combined with stock, facet lists only the four families); invalid / legacy / empty / space-padded `?scent=` values show a "not found" state (never the full catalogue, never echoed, kept across a refresh) with a removable chip and family links; an empty family's own empty state; the unfiltered catalogue and search unchanged; the homepage section hidden until all four families have ≥ 5 active in-stock classified products (stock / archived / unclassified edges), exactly four photo cards once eligible, hidden on product-API failure or empty data; existing homepage sections intact; 1366 / 820 / 390 px, Tab focus ring, reduced motion. Never touches real products; image files checksummed | 5077 | 9347 | 56/56 (focused run, 2026-10-10) |
 | `auth-rate-limit-tests.js` | Login + registration rate limiting (Roadmap Task 3). Unit tests of `rate-limit.js` with an injected clock (threshold, Retry-After, expiry, `clear`, the key cap, the unchanged existing modes; the login throttle's Tier A / Tier B rules, including "a success clears Tier A but never Tier B"), then the real `server.js` **in this process**: Tier A (5 failures per IP + normalised email), Tier B (30 failures per IP), 429 JSON + `Retry-After`, blocked requests never reaching the account lookup, 400 and 403 not counted, registration 10 per IP per hour enforced before validation / MX lookup, and the track-order limiter unchanged. **Database-free:** `./db` is replaced in the require cache by an in-memory fake that refuses writes and unknown queries, `DB_PORT` is forced to 1, and outbound `fetch` and MX lookups are refused and recorded. Client IPs are simulated with `X-Forwarded-For`, which only works because nothing sits in front of a local server | 5079 | — | 51/51 (2026-10-15) |
+| `security-headers-tests.js` | API security headers (Roadmap Task 4, backend Phase A, `security-headers.js`): `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, the API CSP, COOP, CORP and `X-DNS-Prefetch-Control` on successful, private, CORS-preflight, malformed-JSON, 404, 429 and maintenance-503 responses; `X-Powered-By` absent; HSTS (`max-age=86400`) only when `X-Forwarded-Proto` says HTTPS; `Cache-Control: no-store` on the private route groups (`/api/me`, `/api/my-orders`, `/api/addresses`, `/api/wishlist`, `/api/admin/*`, `/api/payments/*`, case-insensitive, whole segments) and never on public catalogue routes; CORS and both rate limits unchanged. Express's default 404 / error handler replaces the CSP with its own `default-src 'none'` on the pages it writes; the suite asserts that real value. **Database-free**, same method as `auth-rate-limit-tests.js` (fake `./db`, `DB_PORT=1`, outbound `fetch` and MX lookups refused) | 5080 | — | 41/41 (2026-10-15) |
 
 ### Why offer behaviour has its own suite
 
@@ -116,7 +117,7 @@ Phase 3's approved scope.
 
 ## Running
 
-All eighteen locate the repo themselves — no environment variable needed:
+All nineteen locate the repo themselves — no environment variable needed:
 
 ```bash
 cd neofragrances-server
@@ -169,7 +170,7 @@ So they do not depend on the shell's working directory, and an explicit
 
 | Variable | Used by | Notes |
 |---|---|---|
-| `SERVER_DIR` | all | Optional for all eighteen — overrides the self-located repo root |
+| `SERVER_DIR` | all | Optional for all nineteen — overrides the self-located repo root |
 | `OUT_DIR` | `e2e-checkout.js` | Optional; defaults to `nf-checkout-shots` in the OS temp directory |
 | `.env` values | all | Read from the repo's `.env` (`DB_*`); each suite injects its own throwaway `JWT_SECRET` |
 
@@ -179,7 +180,7 @@ all use port **5055**, so starting one right after another fails with
 
 ## Safety
 
-- `auth-rate-limit-tests.js` opens no database connection at all: it swaps `./db` for an
+- `auth-rate-limit-tests.js` and `security-headers-tests.js` open no database connection at all: each swaps `./db` for an
   in-memory fake before loading `server.js`, so it writes nothing and leaves nothing
   behind, and it refuses every outbound HTTP request and MX lookup the server attempts.
 - Every other suite exits unless `DB_HOST` is `localhost`/`127.0.0.1`. `payment-tests.js` and
