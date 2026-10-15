@@ -1,0 +1,78 @@
+-- ============================================================
+-- 002  coupons.active — admin enable/disable flag
+-- ============================================================
+-- Backlog: #15 (admin portal, Milestone 6 — promo/coupon management).
+-- Status: applied LOCAL ONLY on 2026-10-03. NOT applied to production.
+--
+-- WHY
+--   The admin promo system needs to take a coupon out of circulation
+--   without destroying its configuration. Today `coupons` has no such
+--   flag, so every coupon is permanently active: pricing.js consults
+--   expires_at and usage_limit only.
+--
+--   There is an accidental kill switch — setting usage_limit = 0 makes
+--   times_used >= usage_limit true immediately — but it must NOT be used.
+--   It reports "This coupon has reached its usage limit" instead of
+--   rejecting the code as unavailable, and it overwrites the real
+--   usage_limit so the original configuration cannot be restored.
+--   A dedicated flag keeps "deactivated" and "used up" distinct.
+--
+-- SCOPE
+--   One column. Deliberately NOT included (not part of this migration):
+--   starts_at, description, min_order_total, created_by, updated_by,
+--   discount_type. The existing two-column discount model
+--   (discount_percent / discount_amount) already carries type + value.
+--
+-- EXISTING DATA
+--   NOT NULL DEFAULT 1 backfills every existing row to active, which
+--   reproduces current behaviour exactly — no code path reads an active
+--   flag today, so every coupon is already implicitly active. No NULLs
+--   are possible and no separate backfill statement is needed.
+--
+--   No index is added. Coupons are located by code (UNIQUE) or id
+--   (PRIMARY), so `active` is a predicate on an already-found row and
+--   never a scan key.
+--
+-- PRE-CHECK (run before applying, on every database)
+--   -- 1. the column must not already exist (expect 0)
+--   SELECT COUNT(*) AS active_col_exists
+--     FROM information_schema.COLUMNS
+--    WHERE TABLE_SCHEMA = DATABASE()
+--      AND TABLE_NAME   = 'coupons'
+--      AND COLUMN_NAME  = 'active';
+--
+--   -- 2. record the row count for the VERIFY step
+--   SELECT COUNT(*) AS total_coupons FROM coupons;
+--
+-- APPLY
+ALTER TABLE coupons
+  ADD COLUMN active TINYINT(1) NOT NULL DEFAULT 1;
+
+-- VERIFY
+--   SHOW COLUMNS FROM coupons LIKE 'active';
+--   -- expect one row: Type = tinyint(1), Null = 'NO', Default = 1
+--
+--   SELECT COUNT(*) AS n_active FROM coupons WHERE active = 1;
+--   -- must equal the total_coupons recorded in the PRE-CHECK
+--
+--   SELECT COUNT(*) AS total_coupons FROM coupons;
+--   -- must be unchanged by this migration
+--
+-- ROLLBACK
+--   ALTER TABLE coupons DROP COLUMN active;
+--
+-- RELEASE CHECKLIST (production / TiDB Cloud — not done)
+--   1. The PRE-CHECK is confirmatory only: it cannot fail on data, it
+--      only guards against applying twice. Unlike 005 (reviews unique
+--      index) there is no duplicate reconciliation to do first.
+--   2. Deliberately plain SQL — no "IF NOT EXISTS" — so it is portable
+--      across MariaDB 10.4 (local) and TiDB (production). Re-running it
+--      fails safely with "Duplicate column name"; it changes nothing.
+--   3. One column per ALTER statement: multi-column ALTER depends on
+--      TiDB's multi-schema-change support, which is version-gated, and
+--      the production TiDB version has not been confirmed.
+--   4. The column has no effect until the application reads it.
+--      pricing.js loadCoupon() selects explicit columns, so `active` is
+--      added to that SELECT and rejected with COUPON_INACTIVE in the
+--      same change set as this migration.
+-- ============================================================

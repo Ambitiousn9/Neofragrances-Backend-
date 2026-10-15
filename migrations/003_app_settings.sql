@@ -1,0 +1,81 @@
+-- ============================================================
+-- 003  app_settings — key/value runtime settings (maintenance mode)
+-- ============================================================
+-- Backlog: #15 (admin portal, Milestone 6 — Phase 2 maintenance mode).
+-- Status: applied LOCAL ONLY (apply date not recorded). NOT applied to production.
+--
+-- WHY
+--   Maintenance mode has to be switchable at runtime by an admin, so it
+--   cannot live in an environment variable: changing one on Render needs a
+--   redeploy, and a redeploy is exactly what you cannot do while the site
+--   is already in trouble. The flag therefore belongs in the database.
+--
+--   Key/value rather than a single-row table because Milestone 6 has more
+--   runtime flags coming; a new one becomes a row, not a migration.
+--
+-- NO SEED ROW — ON PURPOSE
+--   A missing row means maintenance is OFF. That keeps this migration pure
+--   DDL and, more importantly, it makes the safe state the default state:
+--   a fresh database, a failed insert, or a deleted row all read as "site
+--   up" rather than "site down". The application applies the same rule to
+--   a failed SELECT (see settings.js: a read error returns OFF), so a
+--   transient database problem can never escalate into a full storefront
+--   outage. PROJECT-BACKLOG.md records an unexplained production TiDB
+--   incident; fail-closed would have turned that into a blackout.
+--
+-- VALUES
+--   setting_key   'maintenance_mode'
+--   setting_value 'true' | 'false'   (anything other than 'true' reads OFF)
+--
+--   updated_by is the admin's users.id, ON DELETE SET NULL so removing an
+--   admin account never deletes the setting itself.
+--
+-- PRE-CHECK (run before applying, on every database)
+--   -- the table must not already exist (expect 0)
+--   SELECT COUNT(*) AS app_settings_exists
+--     FROM information_schema.TABLES
+--    WHERE TABLE_SCHEMA = DATABASE()
+--      AND TABLE_NAME   = 'app_settings';
+--
+-- APPLY
+CREATE TABLE app_settings (
+  setting_key   VARCHAR(64)  NOT NULL,
+  setting_value VARCHAR(255) NOT NULL,
+  updated_by    INT          DEFAULT NULL,
+  updated_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (setting_key),
+  CONSTRAINT fk_app_settings_updated_by FOREIGN KEY (updated_by) REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+--
+-- VERIFY
+--   SHOW COLUMNS FROM app_settings;
+--   -- expect: setting_key varchar(64) NO PRI, setting_value varchar(255) NO,
+--   --         updated_by int YES, updated_at timestamp NO
+--
+--   SELECT COUNT(*) AS rows_seeded FROM app_settings;
+--   -- expect 0 — the table starts empty and that means maintenance is OFF
+--
+--   SELECT COUNT(*) AS fk_present
+--     FROM information_schema.REFERENTIAL_CONSTRAINTS
+--    WHERE CONSTRAINT_SCHEMA = DATABASE()
+--      AND CONSTRAINT_NAME   = 'fk_app_settings_updated_by';
+--   -- expect 1, with DELETE_RULE = 'SET NULL'
+--
+-- ROLLBACK
+--   DROP TABLE app_settings;
+--   -- Safe: the table holds operational flags only, never customer or
+--   -- catalog data. Dropping it returns the site to "maintenance OFF".
+--
+-- RELEASE CHECKLIST (production / TiDB Cloud — not done)
+--   1. Deliberately plain SQL — no "IF NOT EXISTS" — so it is portable
+--      across MariaDB 10.4 (local) and TiDB (production). Re-running it
+--      fails safely with "Table 'app_settings' already exists".
+--   2. The FOREIGN KEY matches the eight already present in this schema,
+--      so it introduces no new compatibility assumption.
+--   3. No CHECK constraint is used: MariaDB 10.4 enforces CHECK but TiDB's
+--      enforcement is version-gated, and the production TiDB version has
+--      not been confirmed. 'true'/'false' is validated in application code.
+--   4. Deploying the table alone changes nothing a customer can see. The
+--      flag only has an effect once the maintenance middleware ships, and
+--      it defaults to OFF, so the order of deployment is not sensitive.
+-- ============================================================

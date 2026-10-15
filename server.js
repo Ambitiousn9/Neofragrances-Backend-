@@ -8,6 +8,9 @@ const crypto = require("crypto");
 const { OAuth2Client } = require("google-auth-library");
 const dns = require("dns").promises;
 const pool = require("./db");
+const { CURRENCY, PricingError, toCedis, priceCart, signSnapshot, readSignedSnapshot, quoteForClient } = require("./pricing");
+const maintenanceSettings = require("./settings");
+const accounts = require("./accounts");
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 
 if (!GOOGLE_CLIENT_ID) {
@@ -15,7 +18,7 @@ if (!GOOGLE_CLIENT_ID) {
 }
 
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
-const { sendOrderConfirmation, sendPasswordResetEmail, sendVerificationEmail } = require("./mailer");
+const { sendOrderConfirmation, sendPasswordResetEmail, sendVerificationEmail, emailModeNotice } = require("./mailer");
 const app = express();
 
 // Render (and most PaaS hosts) sit behind a reverse proxy — trust the
@@ -23,11 +26,139 @@ const app = express();
 // matters for the password-reset rate limiter below.
 app.set("trust proxy", 1);
 
-app.use(cors());
-app.use(express.json());
+// Explicit origin allowlist — never "*", because these APIs carry bearer tokens and
+// payment calls. CORS_ORIGINS holds a comma-separated list (the production Netlify
+// origin belongs there), and FRONTEND_URL is honoured too since it is already the
+// canonical frontend origin, so production needs no second variable to stay working.
+// The local dev origins are added only outside production.
+const IS_PRODUCTION = process.env.NODE_ENV === "production" || !!process.env.RENDER;
+const DEV_ORIGINS = ["http://127.0.0.1:5500", "http://localhost:5500"];
+const stripSlash = o => String(o).trim().replace(/\/+$/, "");
+const ALLOWED_ORIGINS = new Set([
+  ...String(process.env.CORS_ORIGINS || "").split(",").map(stripSlash).filter(Boolean),
+  ...(process.env.FRONTEND_URL ? [stripSlash(process.env.FRONTEND_URL)] : []),
+  ...(IS_PRODUCTION ? [] : DEV_ORIGINS),
+]);
+
+app.use(cors({
+  origin(origin, callback) {
+    // No Origin header means this is not a browser cross-origin request: the Paystack
+    // webhook, a health check, curl. CORS has nothing to protect there, so allow it.
+    if (!origin) return callback(null, true);
+    callback(null, ALLOWED_ORIGINS.has(stripSlash(origin)));
+  },
+}));
+
+const PAYMENT_WEBHOOK_PATH = "/api/payments/webhook";
+
+// Paystack signs the exact bytes it sends, so the webhook needs the body as received:
+// a re-serialised req.body would not reproduce the signature. Only that one path keeps
+// a copy, so every other request is parsed exactly as before with nothing extra retained.
+app.use(express.json({
+  verify: (req, res, buf) => {
+    if (req.originalUrl.split("?")[0] === PAYMENT_WEBHOOK_PATH) req.rawBody = buf;
+  },
+}));
+
+/* ---------- Maintenance mode (Milestone 6 Phase 2) ----------
+   Placed here deliberately: after express.json so the webhook's rawBody capture
+   above is untouched, and before the first route so it is the single gate for
+   /api/*. Express serves no HTML at all, so this guard governs the API only —
+   the customer-facing page swap is client-side (js/main.js) and is UX, not
+   enforcement. This is the authoritative layer.
+
+   DEFAULT-DENY for /api/*: anything not on the bypass list is blocked while
+   maintenance is on, so a route added later is safely blocked rather than
+   accidentally left open. Paths outside /api/ are never touched.
+
+   Every bypass below was verified against real usage before being added:
+     /api/admin/*                  all 27 routes carry requireAdmin, so bypassing
+                                   adds no exposure — and the admin must be able
+                                   to turn maintenance back off.
+     POST /api/login               the ONLY auth path for admins
+                                   (admin/login.html -> loginUser -> /api/login).
+                                   Blocking it is an unrecoverable lockout.
+     GET  /api/health              Render's health check. A 503 here reads as
+                                   "service down" and can trigger a restart.
+     GET  /api/me                  admin-core.js awaits this during boot; on
+                                   failure its ready promise never resolves and
+                                   EVERY admin page stays dead. GET only —
+                                   PATCH /api/me is a profile edit and is blocked.
+     GET  /api/payments/verify/:ref the customer has already been charged.
+     POST /api/payments/webhook    Paystack treats 5xx as "retry" and eventually
+                                   gives up, which would lose real orders. It is
+                                   signature-authenticated and independently rate
+                                   limited, so leaving it open costs nothing.
+     GET  /api/system/status       the maintenance probe itself.
+
+   The bypass check runs BEFORE the settings read, so a bypassed route — health
+   above all — never depends on the settings query succeeding. */
+const MAINTENANCE_BYPASS_PREFIXES = ["/api/admin/"];
+const MAINTENANCE_BYPASS_EXACT = new Set([
+  "POST /api/login",
+  "GET /api/health",
+  "GET /api/me",
+  "POST " + PAYMENT_WEBHOOK_PATH,
+  "GET /api/system/status",
+]);
+const MAINTENANCE_BYPASS_PATTERNS = [/^GET \/api\/payments\/verify\/[^/]+$/];
+
+function maintenanceBypassed(method, routePath) {
+  const key = `${method} ${routePath}`;
+  if (MAINTENANCE_BYPASS_EXACT.has(key)) return true;
+  if (MAINTENANCE_BYPASS_PREFIXES.some(p => routePath.startsWith(p))) return true;
+  return MAINTENANCE_BYPASS_PATTERNS.some(re => re.test(key));
+}
+
+app.use(async (req, res, next) => {
+  const routePath = req.path;
+  if (!routePath.startsWith("/api/")) return next();
+  if (maintenanceBypassed(req.method, routePath)) return next();
+  let on = false;
+  try {
+    on = await maintenanceSettings.isMaintenanceMode();
+  } catch (err) {
+    // isMaintenanceMode already fails open; this is belt and braces so a bug in
+    // the settings layer can never 500 every request.
+    console.error("maintenance guard read failed — failing OPEN:", err.code || err.message);
+    return next();
+  }
+  if (!on) return next();
+  res.set("Retry-After", "600");
+  return res.status(503).json({
+    error: "NeoFragrances is briefly down for maintenance. Please try again shortly.",
+    code: "MAINTENANCE_MODE",
+  });
+});
+
+// Public, deliberately tiny, and on the bypass list: the storefront polls this
+// to decide whether to show the maintenance page.
+// Returns ONLY what the storefront needs to render the maintenance page:
+// the flag, the progress percentage and the plain-text message. The audit
+// fields (updated_by, updated_by_name, updated_at) stay on the admin endpoint
+// and are never served here, and no other app_settings key is exposed.
+// Fails open via readMaintenanceConfig(), so a settings read error reports
+// maintenance: false rather than taking the site down.
+app.get("/api/system/status", async (req, res) => {
+  const { maintenance, progress, message } = await maintenanceSettings.readMaintenanceConfig();
+  res.json({ maintenance, progress, message });
+});
 
 app.get("/", (req, res) => {
   res.send("NeoFragrances API is running.");
+});
+
+// Liveness + database check for Render's health check. No authentication, and the
+// response carries no connection, credential or driver detail — just whether the
+// database answered. A failure is a 503 so the platform can act on it.
+app.get("/api/health", async (req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ status: "ok", database: "ok" });
+  } catch (err) {
+    console.error("Health check failed:", err.code || err.message);
+    res.status(503).json({ status: "unavailable", database: "unavailable" });
+  }
 });
 // ---------- Google OAuth Configuration ----------
 app.get("/api/config/google-client-id", (req, res) => {
@@ -43,20 +174,59 @@ app.get("/api/config/google-client-id", (req, res) => {
 });
 
 // ---------- Auth middleware: checks the login token on protected routes ----------
-function requireAuth(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "You must be logged in." });
-  }
-  const token = authHeader.split(" ")[1];
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded; // { id, role }
+// Account Controls (Phase 4). A valid signature is no longer sufficient: a
+// token lives for 7 days and an account can be disabled inside that window, so
+// the account behind the token is checked too (cached, see accounts.js).
+//
+// Two rejections, one code. ACCOUNT_DISABLED covers both "this account is
+// disabled" and "this token was invalidated by a disable", because to a client
+// they are the same event: the session is over and a fresh login is required.
+// The messages differ so the customer is told something true in each case.
+const ACCOUNT_DISABLED_MESSAGE = "Your account has been disabled. Please contact support if you think this is a mistake.";
+const SESSION_INVALIDATED_MESSAGE = "Your session is no longer valid. Please log in again.";
+
+// `allowDisabled` is used by exactly ONE route: settling a payment the customer
+// has already been charged for. Nothing else may opt out.
+function authenticate({ allowDisabled }) {
+  return async function (req, res, next) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "You must be logged in." });
+    }
+    const token = authHeader.split(" ")[1];
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
+    } catch (err) {
+      return res.status(401).json({ error: "Your session has expired. Please log in again." });
+    }
+    req.user = decoded; // { id, role, v? } - only .id is ever trusted for authorization
+    if (allowDisabled) return next();
+
+    const status = await accounts.readAccountStatus(decoded.id);
+    if (status.disabled) {
+      return res.status(401).json({ error: ACCOUNT_DISABLED_MESSAGE, code: "ACCOUNT_DISABLED" });
+    }
+    // token_version is incremented on disable and never reset, so a token
+    // minted before the account was last disabled stays dead even after it is
+    // re-enabled - that is what forces a fresh login.
+    //
+    // An ABSENT claim reads as 0. Tokens issued before migration 005 carry no
+    // `v`, and every user starts at token_version 0, so they still match and
+    // nobody is logged out by the upgrade.
+    //
+    // tokenVersion === null means the status lookup failed with nothing cached
+    // (accounts.js fail-open). Comparing against it would reject every token
+    // with a non-zero version, which would be failing closed by accident.
+    if (status.tokenVersion !== null && Number(decoded.v ?? 0) !== status.tokenVersion) {
+      return res.status(401).json({ error: SESSION_INVALIDATED_MESSAGE, code: "ACCOUNT_DISABLED" });
+    }
     next();
-  } catch (err) {
-    return res.status(401).json({ error: "Your session has expired. Please log in again." });
-  }
+  };
 }
+
+const requireAuth = authenticate({ allowDisabled: false });
+const requireAuthAllowDisabled = authenticate({ allowDisabled: true });
 
 // ---------- Products ----------
 app.get("/api/products", async (req, res) => {
@@ -141,7 +311,14 @@ app.post("/api/login", async (req, res) => {
       });
     }
 
-    const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: "7d" });
+    // Account Controls: refuse before a token is minted. 403 mirrors the
+    // unverified-email case above, which is the established shape for "your
+    // credentials were right but you may not sign in".
+    if (user.disabled_at) {
+      return res.status(403).json({ error: ACCOUNT_DISABLED_MESSAGE, code: "ACCOUNT_DISABLED" });
+    }
+
+    const token = jwt.sign({ id: user.id, role: user.role, v: Number(user.token_version) || 0 }, process.env.JWT_SECRET, { expiresIn: "7d" });
 
     res.json({
       token,
@@ -212,6 +389,13 @@ app.post("/api/auth/google", async (req, res) => {
       // Existing NeoFragrances account
       user = existingUsers[0];
 
+      // Account Controls: same refusal as local login. The lookup above is by
+      // email, which is UNIQUE, so a disabled account is always found here and
+      // can never fall through to the branch below and be recreated.
+      if (user.disabled_at) {
+        return res.status(403).json({ error: ACCOUNT_DISABLED_MESSAGE, code: "ACCOUNT_DISABLED" });
+      }
+
       console.log(
         `Google login: existing user ${user.email}`
       );
@@ -229,13 +413,14 @@ app.post("/api/auth/google", async (req, res) => {
       // email-verification-link flow entirely.
       const [result] = await pool.query(
         `INSERT INTO users
-          (full_name, email, phone, password_hash, role, email_verified_at)
-         VALUES (?, ?, ?, ?, 'customer', NOW())`,
+          (full_name, email, phone, password_hash, role, email_verified_at, auth_provider, google_id)
+         VALUES (?, ?, ?, ?, 'customer', NOW(), 'google', ?)`,
         [
           name || "NeoFragrances Customer",
           normalizedEmail,
           null,
           passwordHash,
+          googleId || null,
         ]
       );
 
@@ -256,6 +441,9 @@ app.post("/api/auth/google", async (req, res) => {
       {
         id: user.id,
         role: user.role,
+        // A user created moments ago has no token_version property on the
+        // literal built above; || 0 is the same value the column defaults to.
+        v: Number(user.token_version) || 0,
       },
       process.env.JWT_SECRET,
       {
@@ -282,99 +470,36 @@ app.post("/api/auth/google", async (req, res) => {
   }
 });
 // ---------- Checkout ----------
-app.post("/api/checkout", requireAuth, async (req, res) => {
-  const { items, addressId, couponId } = req.body; // [{ productId, qty }], addressId, couponId
-
-  if (!Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ error: "Your cart is empty." });
-  }
-
-  const connection = await pool.getConnection();
-  try {
-    await connection.beginTransaction();
-
-    const ids = items.map(i => i.productId);
-    const [products] = await connection.query(
-      `SELECT id, price, stock_qty FROM products WHERE id IN (?) AND deleted_at IS NULL`,
-      [ids]
-    );
-
-    let total = 0;
-    const itemDetails = [];
-    for (const item of items) {
-      const product = products.find(p => Number(p.id) === Number(item.productId));
-      if (!product) {
-          console.error("Product mismatch — item.productId:", item.productId, "available product IDs:", products.map(p => p.id));
-          throw new Error("One of the items in your order is no longer available.");
-        }
-      if (product.stock_qty < item.qty) throw new Error(`Not enough stock for one of the items in your cart.`);
-      total += Number(product.price) * item.qty;
-      itemDetails.push({ productId: item.productId, qty: item.qty, price: product.price });
-    }
-
-    let discount = 0;
-    let appliedCoupon = null;
-    if (couponId) {
-      const [couponRows] = await connection.query("SELECT * FROM coupons WHERE id = ?", [couponId]);
-      if (couponRows.length > 0) {
-        appliedCoupon = couponRows[0];
-        if (appliedCoupon.discount_percent) {
-          discount = total * (Number(appliedCoupon.discount_percent) / 100);
-        } else if (appliedCoupon.discount_amount) {
-          discount = Number(appliedCoupon.discount_amount);
-        }
-        discount = Math.min(discount, total);
-      }
-    }
-    const finalTotal = total - discount;
-
-    const [orderResult] = await connection.query(
-      "INSERT INTO orders (user_id, address_id, coupon_id, total, status) VALUES (?, ?, ?, ?, 'Pending')",
-      [req.user.id, addressId || null, couponId || null, finalTotal]
-    );
-    const orderId = orderResult.insertId;
-
-    for (const item of itemDetails) {
-      await connection.query(
-        "INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase) VALUES (?, ?, ?, ?)",
-        [orderId, item.productId, item.qty, item.price]
-      );
-      await connection.query(
-        "UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?",
-        [item.qty, item.productId]
-      );
-    }
-
-    if (appliedCoupon) {
-      await connection.query("UPDATE coupons SET times_used = times_used + 1 WHERE id = ?", [appliedCoupon.id]);
-    }
-
-    await connection.commit();
-    res.status(201).json({ orderId, total: finalTotal, discount });
-  } catch (err) {
-    await connection.rollback();
-    console.error(err);
-    res.status(500).json({ error: err.message || "Checkout failed." });
-  } finally {
-    connection.release();
-  }
+// Disabled: this endpoint created orders without any payment. All orders are
+// now created only by /api/payments/verify after Paystack confirms payment.
+app.post("/api/checkout", requireAuth, (req, res) => {
+  res.status(410).json({ error: "Checkout now happens through secure payment.", code: "CHECKOUT_DISABLED" });
 });
 
 // ---------- A logged-in customer's own order history ----------
 app.get("/api/my-orders", requireAuth, async (req, res) => {
   try {
+    // Only this customer's orders; the delivery address is joined on the same user.
     const [orders] = await pool.query(
-      "SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC",
+      `SELECT o.id, o.total, o.status, o.payment_reference, o.created_at, o.updated_at, o.address_id,
+              a.label AS address_label, a.full_name AS address_full_name, a.phone AS address_phone,
+              a.address_line1, a.address_line2, a.city AS address_city, a.region AS address_region, a.country AS address_country
+         FROM orders o
+         LEFT JOIN addresses a ON a.id = o.address_id AND a.user_id = o.user_id
+        WHERE o.user_id = ?
+        ORDER BY o.created_at DESC, o.id DESC`,
       [req.user.id]
     );
     if (orders.length === 0) return res.json([]);
 
     const orderIds = orders.map(o => o.id);
     const [items] = await pool.query(
-      `SELECT order_items.order_id, order_items.quantity, order_items.price_at_purchase, products.name
+      `SELECT order_items.order_id, order_items.product_id, order_items.quantity, order_items.price_at_purchase,
+              products.name, products.brand, products.image, (products.deleted_at IS NULL) AS available
        FROM order_items
        JOIN products ON order_items.product_id = products.id
-       WHERE order_items.order_id IN (?)`,
+       WHERE order_items.order_id IN (?)
+       ORDER BY order_items.id`,
       [orderIds]
     );
 
@@ -390,14 +515,52 @@ app.get("/api/my-orders", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Could not fetch your orders." });
   }
 });
+
+// ---------- A customer's own order: status history ----------
+// Customer-safe view of order_status_history: statuses and times only. Who made a
+// change, the internal note and the raw source are admin-only and never leave here.
+// A "tracking_started" entry is the migration-006 baseline: the status the order had
+// when history began, recorded at that moment — not when the order reached it.
+app.get("/api/my-orders/:id/history", requireAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(404).json({ error: "Order not found." });
+  try {
+    const [orders] = await pool.query("SELECT id, status, created_at FROM orders WHERE id = ? AND user_id = ?", [id, req.user.id]);
+    if (!orders.length) return res.status(404).json({ error: "Order not found." });
+    const [rows] = await pool.query(
+      "SELECT from_status, to_status, source, created_at FROM order_status_history WHERE order_id = ? ORDER BY id", [id]);
+    res.json({
+      order_id: orders[0].id,
+      status: orders[0].status,
+      placed_at: orders[0].created_at,
+      history: rows.map(r => ({
+        type: r.source === "backfill" ? "tracking_started" : "status_change",
+        from_status: r.source === "backfill" ? null : r.from_status,
+        status: r.to_status,
+        at: r.created_at,
+      })),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not fetch this order's history." });
+  }
+});
 // ---------- Track Order (guest/customer lookup) ----------
 app.post("/api/track-order", async (req, res) => {
-  const { orderId, email } = req.body;
+  // Order numbers are sequential, so limit lookups per IP to stop guessing.
+  if (trackOrderLimiter.limited(`ip:${req.ip}`)) {
+    return res.status(429).json({ error: "Too many tracking attempts. Please wait a few minutes and try again.", code: "RATE_LIMITED" });
+  }
+  const { orderId, email } = req.body || {};
 
   if (!orderId || !email) {
     return res.status(400).json({
       error: "Order number and email address are required."
     });
+  }
+  const cleanOrderId = String(orderId).trim().replace(/^#/, "");
+  if (!isPositiveId(cleanOrderId) || typeof email !== "string" || email.length > 150) {
+    return res.status(404).json({ error: "We could not find an order matching that order number and email address." });
   }
 
   try {
@@ -413,7 +576,7 @@ app.post("/api/track-order", async (req, res) => {
        JOIN users ON orders.user_id = users.id
        WHERE orders.id = ?
          AND LOWER(users.email) = LOWER(?)`,
-      [orderId, email.trim()]
+      [Number(cleanOrderId), email.trim()]
     );
 
     if (orders.length === 0) {
@@ -452,26 +615,262 @@ app.post("/api/track-order", async (req, res) => {
   }
 });
 // ---------- Auth middleware: admin-only routes ----------
+// The role is re-read from the database on every admin request, so a demoted or
+// deleted account loses admin access immediately rather than when its token expires.
 function requireAdmin(req, res, next) {
-  requireAuth(req, res, () => {
-    if (req.user.role !== "admin") {
-      return res.status(403).json({ error: "Admin access only." });
+  requireAuth(req, res, async () => {
+    try {
+      const [rows] = await pool.query("SELECT role FROM users WHERE id = ?", [req.user.id]);
+      if (!rows.length) return res.status(401).json({ error: "Your session has expired. Please log in again." });
+      if (rows[0].role !== "admin") return res.status(403).json({ error: "Admin access only." });
+      next();
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Could not verify admin access." });
     }
-    next();
   });
 }
 
+// ---------- Admin: shared rules ----------
+const LOW_STOCK_THRESHOLD = 5;          // "low stock" = 1..5 units (0 = out of stock)
+const MAX_STOCK_QTY = 100000;
+const PRODUCT_CATEGORIES = ["men", "women", "unisex"];
+// products.scent_family (migration 008). NULL = unassigned. Only the owner assigns a
+// family, through the admin endpoints below; nothing infers one from a product's name.
+const SCENT_FAMILIES = ["floral", "amber", "fresh", "woody"];
+const MAX_SCENT_FAMILY_BATCH = 100;
+const ORDER_STATUSES = ["Pending", "Processing", "Shipped", "Delivered", "Cancelled"];
+const OFFER_TYPES = ["discount", "flash_sale", "new_arrival", "bestseller", "limited"];
+// Images are served from the frontend's images/ folder; only plain relative paths are accepted.
+const IMAGE_PATH_PATTERN = /^images\/[A-Za-z0-9 ._()\/-]{1,240}$/;
+
+// Stock must be a whole number >= 0 (rejects "", null, "true", 2.5, -1).
+function isValidStockQty(value) {
+  if (value === null || value === undefined || value === "" || typeof value === "boolean") return false;
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 0 && n <= MAX_STOCK_QTY;
+}
+
+function adminText(value) {
+  return value === undefined || value === null ? "" : String(value).trim();
+}
+
+function isValidImagePath(value) {
+  return IMAGE_PATH_PATTERN.test(value) && !value.includes("..") && !value.includes("//");
+}
+
+// Validates a full product body (create + edit). Returns { error, field } or { values }.
+function validateProductBody(body) {
+  const name = adminText(body.name), brand = adminText(body.brand), category = adminText(body.category).toLowerCase();
+  const badge = adminText(body.badge), image = adminText(body.image), description = adminText(body.description);
+  const notes = ["top_notes", "middle_notes", "base_notes"].map(k => adminText(body[k]));
+  const price = Number(body.price);
+  if (!name || name.length > 150) return { field: "name", error: "Name is required (up to 150 characters)." };
+  if (!brand || brand.length > 100) return { field: "brand", error: "Brand is required (up to 100 characters)." };
+  if (!PRODUCT_CATEGORIES.includes(category)) return { field: "category", error: "Category must be men, women or unisex." };
+  if (body.price === "" || body.price === null || body.price === undefined || !Number.isFinite(price) || price <= 0 || price > 1000000 || Math.round(price * 100) !== price * 100) {
+    return { field: "price", error: "Price must be more than 0 with at most 2 decimal places." };
+  }
+  if (badge.length > 20) return { field: "badge", error: "Badge must be 20 characters or fewer." };
+  if (image && !isValidImagePath(image)) return { field: "image", error: "Image must be a path inside images/, e.g. images/perfumes/name.jpg." };
+  if (description.length > 5000) return { field: "description", error: "Description must be 5000 characters or fewer." };
+  const longNote = notes.findIndex(n => n.length > 255);
+  if (longNote !== -1) return { field: ["top_notes", "middle_notes", "base_notes"][longNote], error: "Notes must be 255 characters or fewer." };
+  return { values: { name, brand, category, price, badge: badge || null, image: image || null, description: description || null, top_notes: notes[0] || null, middle_notes: notes[1] || null, base_notes: notes[2] || null } };
+}
+
+// Scent family writes. The body must name scent_family explicitly: one of SCENT_FAMILIES
+// (case-insensitive) or null to unassign. A missing key, "", any other string, numbers,
+// booleans, arrays and objects are rejected, so a family is never cleared by accident.
+// Returns { error, field } or { value }.
+function parseScentFamilyBody(body) {
+  const error = { field: "scent_family", error: "Scent family must be floral, amber, fresh or woody, or null to unassign it." };
+  if (!body || typeof body !== "object" || Array.isArray(body) || !("scent_family" in body)) return error;
+  const v = body.scent_family;
+  if (v === null) return { value: null };
+  if (typeof v === "string" && SCENT_FAMILIES.includes(v.trim().toLowerCase())) return { value: v.trim().toLowerCase() };
+  return error;
+}
+
+// Account Controls: matches users.disabled_reason VARCHAR(200) (migration 005).
+const ACCOUNT_REASON_MAX = 200;
+
+function positiveIdParam(req, res) {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) { res.status(404).json({ error: "Not found." }); return null; }
+  return id;
+}
+
+// LIKE pattern with user wildcards escaped.
+function likePattern(term) {
+  return `%${term.replace(/[\\%_]/g, ch => "\\" + ch)}%`;
+}
+
+// Order status rules (Phase 5). Moving forward along the fulfilment flow needs no note.
+// Cancelling is only possible before the order ships, restocks, and needs a note.
+// Moving backward (a correction) needs a note. A cancelled order is final.
+const ORDER_FLOW = ["Pending", "Processing", "Shipped", "Delivered"];
+const CANCELLABLE_STATUSES = ["Pending", "Processing"];
+// Matches order_status_history.note VARCHAR(500) (migration 006).
+const ORDER_NOTE_MAX = 500;
+
+// Returns null when current -> next is allowed, else { status, code, error }.
+// The same-status no-op is handled by the caller before this is consulted.
+function orderTransitionError(current, next) {
+  if (current === "Cancelled") return { status: 409, code: "ORDER_FINAL", error: "This order was cancelled and can't be changed." };
+  if (next === "Cancelled" && !CANCELLABLE_STATUSES.includes(current)) {
+    return { status: 409, code: "ORDER_NOT_CANCELLABLE", error: `This order is already ${current.toLowerCase()}, so it can't be cancelled.` };
+  }
+  return null;
+}
+
+function orderTransitionNeedsNote(current, next) {
+  return next === "Cancelled" || ORDER_FLOW.indexOf(next) < ORDER_FLOW.indexOf(current);
+}
+
+function allowedNextStatuses(current) {
+  return ORDER_STATUSES.filter(s => s !== current && !orderTransitionError(current, s));
+}
+
+// ---------- Admin: dashboard summary ----------
+app.get("/api/admin/summary", requireAdmin, async (req, res) => {
+  try {
+    const [[products]] = await pool.query(
+      `SELECT COUNT(*) AS total,
+              COALESCE(SUM(deleted_at IS NULL), 0) AS active,
+              COALESCE(SUM(deleted_at IS NOT NULL), 0) AS archived,
+              COALESCE(SUM(deleted_at IS NULL AND stock_qty = 0), 0) AS out_of_stock,
+              COALESCE(SUM(deleted_at IS NULL AND stock_qty BETWEEN 1 AND ?), 0) AS low_stock
+         FROM products`, [LOW_STOCK_THRESHOLD]);
+    const [statusRows] = await pool.query("SELECT status, COUNT(*) AS n, COALESCE(SUM(total), 0) AS amount FROM orders GROUP BY status");
+    const [[recent30]] = await pool.query(
+      `SELECT COUNT(*) AS orders, COALESCE(SUM(total), 0) AS revenue
+         FROM orders WHERE status <> 'Cancelled' AND created_at >= NOW() - INTERVAL 30 DAY`);
+    const [[customers]] = await pool.query(
+      `SELECT COUNT(*) AS total,
+              COALESCE(SUM(email_verified_at IS NOT NULL), 0) AS verified,
+              COALESCE(SUM(created_at >= NOW() - INTERVAL 30 DAY), 0) AS new_30d
+         FROM users WHERE role = 'customer'`);
+    const [offerRows] = await pool.query("SELECT start_at, end_at, active FROM offers");
+    const [[reviews]] = await pool.query("SELECT COUNT(*) AS total, AVG(rating) AS avg_rating FROM reviews");
+    const [recentOrders] = await pool.query(
+      `SELECT o.id, o.total, o.status, o.created_at, u.full_name AS customer_name,
+              (SELECT COALESCE(SUM(quantity), 0) FROM order_items oi WHERE oi.order_id = o.id) AS item_count
+         FROM orders o JOIN users u ON u.id = o.user_id
+        ORDER BY o.created_at DESC, o.id DESC LIMIT 6`);
+    const [lowStock] = await pool.query(
+      `SELECT id, name, brand, image, stock_qty FROM products
+        WHERE deleted_at IS NULL AND stock_qty BETWEEN 1 AND ?
+        ORDER BY stock_qty ASC, name ASC LIMIT 8`, [LOW_STOCK_THRESHOLD]);
+    const [recentReviews] = await pool.query(
+      `SELECT r.id, r.rating, r.comment, r.created_at, r.is_verified_purchase,
+              p.id AS product_id, p.name AS product_name, u.full_name AS customer_name
+         FROM reviews r JOIN products p ON p.id = r.product_id JOIN users u ON u.id = r.user_id
+        ORDER BY r.created_at DESC, r.id DESC LIMIT 5`);
+
+    const byStatus = Object.fromEntries(ORDER_STATUSES.map(s => [s, 0]));
+    let ordersTotal = 0, revenue = 0, paidOrders = 0;
+    statusRows.forEach(r => {
+      const n = Number(r.n);
+      byStatus[r.status] = (byStatus[r.status] || 0) + n;
+      ordersTotal += n;
+      if (r.status !== "Cancelled") { revenue += Number(r.amount); paidOrders += n; }
+    });
+    const offerStatus = { Active: 0, Scheduled: 0, Expired: 0, Disabled: 0 };
+    offerRows.forEach(o => { offerStatus[computeOfferStatus(o)]++; });
+    const n = v => Number(v) || 0;
+
+    res.json({
+      low_stock_threshold: LOW_STOCK_THRESHOLD,
+      products: { total: n(products.total), active: n(products.active), archived: n(products.archived), out_of_stock: n(products.out_of_stock), low_stock: n(products.low_stock) },
+      orders: {
+        total: ordersTotal, by_status: byStatus,
+        revenue: Math.round(revenue * 100) / 100,
+        average_order_value: paidOrders ? Math.round((revenue / paidOrders) * 100) / 100 : 0,
+        last_30_days: { orders: n(recent30.orders), revenue: Math.round(Number(recent30.revenue) * 100) / 100 },
+      },
+      customers: { total: n(customers.total), verified: n(customers.verified), new_30d: n(customers.new_30d) },
+      offers: { live: offerStatus.Active, scheduled: offerStatus.Scheduled, expired: offerStatus.Expired, disabled: offerStatus.Disabled },
+      reviews: { total: n(reviews.total), average_rating: reviews.avg_rating === null ? null : Math.round(Number(reviews.avg_rating) * 10) / 10 },
+      recent_orders: recentOrders.map(o => ({ ...o, item_count: n(o.item_count) })),
+      low_stock_products: lowStock,
+      recent_reviews: recentReviews,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not load the dashboard." });
+  }
+});
+
+// ---------- Admin: reports (real order data only) ----------
+app.get("/api/admin/reports", requireAdmin, async (req, res) => {
+  const days = [7, 30, 90, 365].includes(Number(req.query.days)) ? Number(req.query.days) : 30;
+  try {
+    const [daily] = await pool.query(
+      `SELECT DATE_FORMAT(created_at, '%Y-%m-%d') AS day, COUNT(*) AS orders, COALESCE(SUM(total), 0) AS revenue
+         FROM orders WHERE status <> 'Cancelled' AND created_at >= CURDATE() - INTERVAL ? DAY
+        GROUP BY day ORDER BY day`, [days - 1]);
+    const itemsJoin = `FROM order_items oi JOIN orders o ON o.id = oi.order_id JOIN products p ON p.id = oi.product_id
+                       WHERE o.status <> 'Cancelled' AND o.created_at >= CURDATE() - INTERVAL ? DAY`;
+    const [products] = await pool.query(
+      `SELECT p.id, p.name, p.brand, p.image, (p.deleted_at IS NOT NULL) AS archived,
+              SUM(oi.quantity) AS units, SUM(oi.quantity * oi.price_at_purchase) AS revenue
+         ${itemsJoin} GROUP BY p.id ORDER BY units DESC, revenue DESC LIMIT 10`, [days - 1]);
+    const [brands] = await pool.query(
+      `SELECT p.brand, SUM(oi.quantity) AS units, SUM(oi.quantity * oi.price_at_purchase) AS revenue
+         ${itemsJoin} GROUP BY p.brand ORDER BY revenue DESC LIMIT 10`, [days - 1]);
+    const [categories] = await pool.query(
+      `SELECT p.category, SUM(oi.quantity) AS units, SUM(oi.quantity * oi.price_at_purchase) AS revenue
+         ${itemsJoin} GROUP BY p.category ORDER BY revenue DESC`, [days - 1]);
+    const [statuses] = await pool.query(
+      "SELECT status, COUNT(*) AS n FROM orders WHERE created_at >= CURDATE() - INTERVAL ? DAY GROUP BY status", [days - 1]);
+    const [[custs]] = await pool.query(
+      "SELECT COUNT(*) AS n FROM users WHERE role = 'customer' AND created_at >= CURDATE() - INTERVAL ? DAY", [days - 1]);
+    const num = rows => rows.map(r => ({ ...r, units: Number(r.units) || 0, revenue: Math.round(Number(r.revenue) * 100) / 100, ...(r.orders !== undefined ? { orders: Number(r.orders) } : {}), ...(r.archived !== undefined ? { archived: !!Number(r.archived) } : {}) }));
+    res.json({
+      days,
+      daily: daily.map(d => ({ day: d.day, orders: Number(d.orders), revenue: Math.round(Number(d.revenue) * 100) / 100 })),
+      top_products: num(products), brands: num(brands), categories: num(categories),
+      statuses: Object.fromEntries(statuses.map(s => [s.status, Number(s.n)])),
+      new_customers: Number(custs.n) || 0,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not load reports." });
+  }
+});
+
+// ---------- Admin: products (incl. archived) ----------
+app.get("/api/admin/products", requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT p.*, COALESCE(s.units, 0) AS units_sold
+         FROM products p
+         LEFT JOIN (SELECT oi.product_id, SUM(oi.quantity) AS units
+                      FROM order_items oi JOIN orders o ON o.id = oi.order_id
+                     WHERE o.status <> 'Cancelled' GROUP BY oi.product_id) s ON s.product_id = p.id
+        ORDER BY p.deleted_at IS NOT NULL, p.name`);
+    res.json(rows.map(p => ({ ...p, units_sold: Number(p.units_sold) })));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not fetch products." });
+  }
+});
+
 // ---------- Admin: Create Product ----------
 app.post("/api/admin/products", requireAdmin, async (req, res) => {
-  const { name, brand, category, price, stock_qty, badge, image, description, top_notes, middle_notes, base_notes } = req.body;
-  if (!name || !brand || !category || price == null) {
-    return res.status(400).json({ error: "Name, brand, category, and price are required." });
+  const v = validateProductBody(req.body);
+  if (v.error) return res.status(400).json({ error: v.error, field: v.field });
+  const { stock_qty } = req.body;
+  if (stock_qty !== undefined && !isValidStockQty(stock_qty)) {
+    return res.status(400).json({ error: `Stock quantity must be a whole number from 0 to ${MAX_STOCK_QTY}.`, field: "stock_qty" });
   }
+  const p = v.values;
   try {
     const [result] = await pool.query(
       `INSERT INTO products (name, brand, category, price, stock_qty, badge, image, description, top_notes, middle_notes, base_notes)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [name, brand, category, price, stock_qty || 0, badge || null, image || null, description || null, top_notes || null, middle_notes || null, base_notes || null]
+      [p.name, p.brand, p.category, p.price, stock_qty === undefined ? 0 : Number(stock_qty), p.badge, p.image, p.description, p.top_notes, p.middle_notes, p.base_notes]
     );
     res.status(201).json({ id: result.insertId });
   } catch (err) {
@@ -482,12 +881,22 @@ app.post("/api/admin/products", requireAdmin, async (req, res) => {
 
 // ---------- Admin: Update Product ----------
 app.put("/api/admin/products/:id", requireAdmin, async (req, res) => {
-  const { name, brand, category, price, stock_qty, badge, image, description, top_notes, middle_notes, base_notes } = req.body;
+  const id = positiveIdParam(req, res); if (!id) return;
+  const v = validateProductBody(req.body);
+  if (v.error) return res.status(400).json({ error: v.error, field: v.field });
+  // stock_qty is only updated when sent (the admin form omits it unless changed),
+  // so editing other fields can never overwrite or zero the current stock.
+  const setStock = "stock_qty" in req.body;
+  if (setStock && !isValidStockQty(req.body.stock_qty)) {
+    return res.status(400).json({ error: `Stock quantity must be a whole number from 0 to ${MAX_STOCK_QTY}.`, field: "stock_qty" });
+  }
+  const p = v.values;
   try {
-    await pool.query(
-      `UPDATE products SET name=?, brand=?, category=?, price=?, stock_qty=?, badge=?, image=?, description=?, top_notes=?, middle_notes=?, base_notes=? WHERE id=?`,
-      [name, brand, category, price, stock_qty, badge || null, image, description || null, top_notes, middle_notes, base_notes, req.params.id]
+    const [result] = await pool.query(
+      `UPDATE products SET name=?, brand=?, category=?, price=?, ${setStock ? "stock_qty=?, " : ""}badge=?, image=?, description=?, top_notes=?, middle_notes=?, base_notes=? WHERE id=?`,
+      [p.name, p.brand, p.category, p.price, ...(setStock ? [Number(req.body.stock_qty)] : []), p.badge, p.image, p.description, p.top_notes, p.middle_notes, p.base_notes, id]
     );
+    if (!result.affectedRows) return res.status(404).json({ error: "Product not found." });
     res.json({ success: true });
   } catch (err) {
     console.error(err);
@@ -495,96 +904,539 @@ app.put("/api/admin/products/:id", requireAdmin, async (req, res) => {
   }
 });
 
-// ---------- Admin: Delete Product (soft-delete) ----------
+// ---------- Admin: Archive Product (soft-delete) ----------
 app.delete("/api/admin/products/:id", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
   try {
-    await pool.query("UPDATE products SET deleted_at = NOW() WHERE id = ?", [req.params.id]);
+    const [result] = await pool.query("UPDATE products SET deleted_at = NOW() WHERE id = ? AND deleted_at IS NULL", [id]);
+    if (!result.affectedRows) return res.status(404).json({ error: "Product not found or already archived." });
     res.json({ success: true });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Could not delete product." });
+    res.status(500).json({ error: "Could not archive product." });
   }
 });
 
-// ---------- Admin: Update Stock ----------
-app.patch("/api/admin/products/:id/stock", requireAdmin, async (req, res) => {
-  const { stock_qty } = req.body;
-  if (stock_qty == null || stock_qty < 0) {
-    return res.status(400).json({ error: "Invalid stock quantity." });
-  }
+// ---------- Admin: Restore archived Product ----------
+app.patch("/api/admin/products/:id/restore", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
   try {
-    await pool.query("UPDATE products SET stock_qty = ? WHERE id = ?", [stock_qty, req.params.id]);
+    const [result] = await pool.query("UPDATE products SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL", [id]);
+    if (!result.affectedRows) return res.status(404).json({ error: "Product not found or not archived." });
     res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not restore product." });
+  }
+});
+
+// ---------- Admin: Update Stock (set a quantity, or adjust by +/- n) ----------
+app.patch("/api/admin/products/:id/stock", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  const { stock_qty, adjust } = req.body;
+  try {
+    let result;
+    if (adjust !== undefined) {
+      const delta = Number(adjust);
+      if (typeof adjust === "boolean" || adjust === "" || !Number.isInteger(delta) || delta === 0 || Math.abs(delta) > MAX_STOCK_QTY) {
+        return res.status(400).json({ error: "Adjustment must be a non-zero whole number." });
+      }
+      // Atomic: never lets stock drop below 0 or exceed the maximum.
+      [result] = await pool.query(
+        "UPDATE products SET stock_qty = stock_qty + ? WHERE id = ? AND stock_qty + ? BETWEEN 0 AND ?",
+        [delta, id, delta, MAX_STOCK_QTY]);
+      if (!result.affectedRows) {
+        const [exists] = await pool.query("SELECT stock_qty FROM products WHERE id = ?", [id]);
+        if (!exists.length) return res.status(404).json({ error: "Product not found." });
+        return res.status(400).json({ error: `That would take stock below 0 (currently ${exists[0].stock_qty}).`, code: "NEGATIVE_STOCK" });
+      }
+    } else {
+      if (!isValidStockQty(stock_qty)) {
+        return res.status(400).json({ error: `Stock quantity must be a whole number from 0 to ${MAX_STOCK_QTY}.` });
+      }
+      [result] = await pool.query("UPDATE products SET stock_qty = ? WHERE id = ?", [Number(stock_qty), id]);
+      if (!result.affectedRows) return res.status(404).json({ error: "Product not found." });
+    }
+    const [[row]] = await pool.query("SELECT stock_qty FROM products WHERE id = ?", [id]);
+    res.json({ success: true, stock_qty: row.stock_qty });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Could not update stock." });
   }
 });
 
-// ---------- Admin: Get all orders ----------
-app.get("/api/admin/orders", requireAdmin, async (req, res) => {
+// ---------- Admin: Scent family (one product) ----------
+// Writes products.scent_family only. "updated_at = updated_at" keeps the row's last-updated
+// time as it was (the column has ON UPDATE CURRENT_TIMESTAMP): classifying a product is
+// not an edit of its details. Archived products are refused, so restore one first.
+app.patch("/api/admin/products/:id/scent-family", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  const family = parseScentFamilyBody(req.body);
+  if (family.error) return res.status(400).json({ error: family.error, field: family.field });
   try {
-    const [orders] = await pool.query(`
-      SELECT orders.*,
-             users.full_name AS customer_name,
-             users.email AS customer_email,
-             users.phone AS customer_phone,
-             addresses.full_name AS delivery_name,
-             addresses.phone AS delivery_phone,
-             addresses.address_line1,
-             addresses.address_line2,
-             addresses.city,
-             addresses.region,
-             addresses.country
-      FROM orders
-      JOIN users ON orders.user_id = users.id
-      LEFT JOIN addresses ON orders.address_id = addresses.id
-      ORDER BY orders.created_at DESC
-    `);
-    const [itemCounts] = await pool.query(`
-      SELECT order_id, COUNT(*) AS item_count FROM order_items GROUP BY order_id
-    `);
-    const countMap = {};
-    itemCounts.forEach(r => { countMap[r.order_id] = r.item_count; });
-    res.json(orders.map(o => ({ ...o, item_count: countMap[o.id] || 0 })));
+    const [rows] = await pool.query("SELECT id, deleted_at FROM products WHERE id = ?", [id]);
+    if (!rows.length) return res.status(404).json({ error: "Product not found." });
+    // 409 (well formed but refused), per the admin convention; never 403, which the admin
+    // portal reads as an expired session.
+    if (rows[0].deleted_at) return res.status(409).json({ error: "This product is archived. Restore it before changing its scent family.", code: "PRODUCT_ARCHIVED" });
+    const [result] = await pool.query(
+      "UPDATE products SET scent_family = ?, updated_at = updated_at WHERE id = ? AND deleted_at IS NULL",
+      [family.value, id]);
+    // Matched rows (mysql2 sets FOUND_ROWS), so re-saving the same family still counts as 1.
+    if (!result.affectedRows) return res.status(404).json({ error: "Product not found." });
+    res.json({ success: true, id, scent_family: family.value });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not update the scent family." });
+  }
+});
+
+// ---------- Admin: Scent family (bulk, all-or-nothing) ----------
+// Body: { product_ids: [1..100 distinct positive ids], scent_family: "<family>" | null }.
+// Every id is checked inside one transaction (rows locked) before anything is written; a
+// missing or archived product (400, listed like offer items are), or any failure while
+// writing (500), rolls the whole batch back.
+app.patch("/api/admin/products/scent-family", requireAdmin, async (req, res) => {
+  const body = req.body;
+  const raw = body && typeof body === "object" ? body.product_ids : undefined;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return res.status(400).json({ error: "Choose at least one product.", field: "product_ids" });
+  }
+  if (raw.length > MAX_SCENT_FAMILY_BATCH) {
+    return res.status(400).json({ error: `At most ${MAX_SCENT_FAMILY_BATCH} products can be updated at once.`, field: "product_ids" });
+  }
+  const ids = raw.map(v => (typeof v === "boolean" || v === null || v === "" ? NaN : Number(v)));
+  if (!ids.every(n => Number.isInteger(n) && n > 0)) {
+    return res.status(400).json({ error: "Product IDs must be positive whole numbers.", field: "product_ids" });
+  }
+  if (new Set(ids).size !== ids.length) {
+    return res.status(400).json({ error: "Each product can only be listed once.", field: "product_ids" });
+  }
+  const family = parseScentFamilyBody(body);
+  if (family.error) return res.status(400).json({ error: family.error, field: family.field });
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.query("SELECT id, deleted_at FROM products WHERE id IN (?) FOR UPDATE", [ids]);
+    const found = new Map(rows.map(r => [r.id, r]));
+    const missing = ids.filter(n => !found.has(n));
+    const archived = ids.filter(n => found.has(n) && found.get(n).deleted_at);
+    if (missing.length || archived.length) {
+      await connection.rollback();
+      return res.status(400).json({
+        error: "Nothing was changed: some products don't exist or are archived.",
+        field: "product_ids", code: "INELIGIBLE_PRODUCTS", missing, archived,
+      });
+    }
+    const [result] = await connection.query(
+      "UPDATE products SET scent_family = ?, updated_at = updated_at WHERE id IN (?) AND deleted_at IS NULL",
+      [family.value, ids]);
+    if (result.affectedRows !== ids.length) throw new Error(`scent-family batch matched ${result.affectedRows} of ${ids.length} rows`);
+    await connection.commit();
+    res.json({ success: true, updated: ids.length, scent_family: family.value, product_ids: ids });
+  } catch (err) {
+    await connection.rollback().catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: "Could not update scent families. Nothing was changed." });
+  } finally {
+    connection.release();
+  }
+});
+
+// ---------- Admin: orders (filtered + paginated) ----------
+app.get("/api/admin/orders", requireAdmin, async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const pageSize = Math.min(1000, Math.max(1, parseInt(req.query.pageSize, 10) || 25));
+  const where = [], params = [];
+  const status = adminText(req.query.status);
+  if (status && status !== "all") {
+    if (!ORDER_STATUSES.includes(status)) return res.status(400).json({ error: "Invalid status filter." });
+    where.push("o.status = ?"); params.push(status);
+  }
+  const q = adminText(req.query.q).replace(/^#/, "").slice(0, 100);
+  if (q) {
+    const like = likePattern(q);
+    where.push("(o.id = ? OR u.full_name LIKE ? OR u.email LIKE ? OR o.payment_reference LIKE ?)");
+    params.push(/^\d+$/.test(q) ? Number(q) : -1, like, like, like);
+  }
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+  if (datePattern.test(adminText(req.query.from))) { where.push("o.created_at >= ?"); params.push(`${req.query.from} 00:00:00`); }
+  if (datePattern.test(adminText(req.query.to))) { where.push("o.created_at <= ?"); params.push(`${req.query.to} 23:59:59`); }
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  try {
+    const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total FROM orders o JOIN users u ON u.id = o.user_id ${whereSql}`, params);
+    const [orders] = await pool.query(
+      `SELECT o.id, o.total, o.status, o.payment_reference, o.created_at, o.updated_at,
+              u.id AS customer_id, u.full_name AS customer_name, u.email AS customer_email, u.phone AS customer_phone,
+              a.city, a.region,
+              (SELECT COALESCE(SUM(quantity), 0) FROM order_items oi WHERE oi.order_id = o.id) AS item_count
+         FROM orders o
+         JOIN users u ON u.id = o.user_id
+         LEFT JOIN addresses a ON a.id = o.address_id
+         ${whereSql}
+        ORDER BY o.created_at DESC, o.id DESC
+        LIMIT ? OFFSET ?`, [...params, pageSize, (page - 1) * pageSize]);
+    const [counts] = await pool.query("SELECT status, COUNT(*) AS n FROM orders GROUP BY status");
+    res.json({
+      orders: orders.map(o => ({ ...o, item_count: Number(o.item_count) })),
+      total: Number(total), page, pageSize,
+      status_counts: Object.fromEntries(ORDER_STATUSES.map(s => [s, Number((counts.find(c => c.status === s) || {}).n || 0)])),
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Could not fetch orders." });
   }
 });
 
-// ---------- Admin: Update order status ----------
-app.patch("/api/admin/orders/:id/status", requireAdmin, async (req, res) => {
-  const { status } = req.body;
-  const validStatuses = ["Pending", "Processing", "Shipped", "Delivered", "Cancelled"];
-  if (!validStatuses.includes(status)) {
-    return res.status(400).json({ error: "Invalid status." });
-  }
+// ---------- Admin: order details ----------
+app.get("/api/admin/orders/:id", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
   try {
-    await pool.query("UPDATE orders SET status = ? WHERE id = ?", [status, req.params.id]);
-    res.json({ success: true });
+    const [rows] = await pool.query(
+      `SELECT o.id, o.total, o.status, o.payment_reference, o.created_at, o.updated_at, o.address_id,
+              u.id AS customer_id, u.full_name AS customer_name, u.email AS customer_email, u.phone AS customer_phone,
+              u.created_at AS customer_since,
+              a.full_name AS delivery_name, a.phone AS delivery_phone, a.address_line1, a.address_line2,
+              a.city, a.region, a.country, a.label AS address_label
+         FROM orders o
+         JOIN users u ON u.id = o.user_id
+         LEFT JOIN addresses a ON a.id = o.address_id
+        WHERE o.id = ?`, [id]);
+    if (!rows.length) return res.status(404).json({ error: "Order not found." });
+    const [items] = await pool.query(
+      `SELECT oi.product_id, oi.quantity, oi.price_at_purchase,
+              p.name, p.brand, p.image, p.stock_qty, (p.deleted_at IS NOT NULL) AS archived
+         FROM order_items oi LEFT JOIN products p ON p.id = oi.product_id
+        WHERE oi.order_id = ? ORDER BY oi.id`, [id]);
+    const [[{ customer_orders }]] = await pool.query("SELECT COUNT(*) AS customer_orders FROM orders WHERE user_id = ?", [rows[0].customer_id]);
+    const [history] = await pool.query(
+      `SELECT h.id, h.from_status, h.to_status, h.changed_by, u.full_name AS changed_by_name,
+              h.source, h.note, h.created_at
+         FROM order_status_history h LEFT JOIN users u ON u.id = h.changed_by
+        WHERE h.order_id = ? ORDER BY h.id`, [id]);
+    const order = rows[0];
+    const allowed = allowedNextStatuses(order.status);
+    res.json({
+      ...order,
+      customer_orders: Number(customer_orders),
+      items: items.map(i => ({ ...i, archived: !!Number(i.archived) })),
+      items_subtotal: Math.round(items.reduce((s, i) => s + Number(i.price_at_purchase) * i.quantity, 0) * 100) / 100,
+      allowed_statuses: allowed,
+      note_required_statuses: allowed.filter(s => orderTransitionNeedsNote(order.status, s)),
+      status_history: history,
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Could not update order status." });
+    res.status(500).json({ error: "Could not fetch the order." });
   }
 });
 
-// ---------- Admin: Get all customers ----------
+// ---------- Admin: Update order status ----------
+// Cancelling (Pending/Processing only) returns the order's items to stock in the same
+// transaction, and is final. Every real change writes one order_status_history row in
+// that transaction too, so the status, the restock and the history commit or roll back together.
+app.patch("/api/admin/orders/:id/status", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  const { status, note: rawNote } = req.body || {};
+  if (!ORDER_STATUSES.includes(status)) {
+    return res.status(400).json({ error: "Invalid status." });
+  }
+  if (rawNote !== undefined && rawNote !== null && typeof rawNote !== "string") {
+    return res.status(400).json({ error: "Note must be text.", field: "note" });
+  }
+  const note = adminText(rawNote);
+  if (note.length > ORDER_NOTE_MAX) {
+    return res.status(400).json({ error: `Note must be ${ORDER_NOTE_MAX} characters or fewer.`, field: "note" });
+  }
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.query("SELECT status FROM orders WHERE id = ? FOR UPDATE", [id]);
+    if (!rows.length) { await connection.rollback(); return res.status(404).json({ error: "Order not found." }); }
+    const current = rows[0].status;
+    if (current === status) { await connection.rollback(); return res.json({ success: true, status, restocked: 0 }); }
+    const rejected = orderTransitionError(current, status);
+    if (rejected) {
+      await connection.rollback();
+      return res.status(rejected.status).json({ error: rejected.error, code: rejected.code });
+    }
+    if (!note && orderTransitionNeedsNote(current, status)) {
+      await connection.rollback();
+      return res.status(400).json({
+        error: status === "Cancelled" ? "Add a note explaining why this order is being cancelled." : `Add a note explaining why this order is moving back to ${status}.`,
+        code: "NOTE_REQUIRED", field: "note",
+      });
+    }
+    let restocked = 0;
+    if (status === "Cancelled") {
+      const [result] = await connection.query(
+        `UPDATE products p
+           JOIN (SELECT product_id, SUM(quantity) AS qty FROM order_items WHERE order_id = ? GROUP BY product_id) x
+             ON x.product_id = p.id
+            SET p.stock_qty = p.stock_qty + x.qty`, [id]);
+      restocked = result.affectedRows;
+    }
+    await connection.query("UPDATE orders SET status = ? WHERE id = ?", [status, id]);
+    await connection.query(
+      `INSERT INTO order_status_history (order_id, from_status, to_status, changed_by, source, note)
+       VALUES (?, ?, ?, ?, 'admin', ?)`, [id, current, status, req.user.id, note || null]);
+    await connection.commit();
+    res.json({ success: true, status, restocked });
+  } catch (err) {
+    await connection.rollback();
+    console.error(err);
+    res.status(500).json({ error: "Could not update order status." });
+  } finally {
+    connection.release();
+  }
+});
+
+// ---------- Admin: customers ----------
 app.get("/api/admin/customers", requireAdmin, async (req, res) => {
   try {
     const [customers] = await pool.query(`
-      SELECT users.id, users.full_name, users.email, users.phone, users.created_at,
-             COUNT(orders.id) AS order_count
-      FROM users
-      LEFT JOIN orders ON orders.user_id = users.id
-      WHERE users.role = 'customer'
-      GROUP BY users.id
-      ORDER BY users.created_at DESC
+      SELECT u.id, u.full_name, u.email, u.phone, u.created_at, u.auth_provider,
+             u.disabled_at,
+             (u.email_verified_at IS NOT NULL) AS email_verified,
+             COUNT(o.id) AS order_count,
+             COALESCE(SUM(CASE WHEN o.status <> 'Cancelled' THEN o.total ELSE 0 END), 0) AS total_spent,
+             MAX(o.created_at) AS last_order_at
+        FROM users u
+        LEFT JOIN orders o ON o.user_id = u.id
+       WHERE u.role = 'customer'
+       GROUP BY u.id
+       ORDER BY u.created_at DESC
     `);
-    res.json(customers);
+    // disabled_reason is deliberately NOT in the list payload: the list is a
+    // scanning view, and the reason belongs next to the account it explains.
+    res.json(customers.map(c => ({ ...c, email_verified: !!Number(c.email_verified), disabled: !!c.disabled_at, order_count: Number(c.order_count), total_spent: Math.round(Number(c.total_spent) * 100) / 100 })));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Could not fetch customers." });
+  }
+});
+
+app.get("/api/admin/customers/:id", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, full_name, email, phone, created_at, auth_provider, disabled_at, disabled_reason,
+              (email_verified_at IS NOT NULL) AS email_verified
+         FROM users WHERE id = ? AND role = 'customer'`, [id]);
+    if (!rows.length) return res.status(404).json({ error: "Customer not found." });
+    const [orders] = await pool.query(
+      `SELECT o.id, o.total, o.status, o.created_at,
+              (SELECT COALESCE(SUM(quantity), 0) FROM order_items oi WHERE oi.order_id = o.id) AS item_count
+         FROM orders o WHERE o.user_id = ? ORDER BY o.created_at DESC, o.id DESC`, [id]);
+    const [addresses] = await pool.query(
+      `SELECT id, label, full_name, phone, address_line1, address_line2, city, region, country, is_default
+         FROM addresses WHERE user_id = ? ORDER BY is_default DESC, created_at DESC`, [id]);
+    const [[counts]] = await pool.query(
+      `SELECT (SELECT COUNT(*) FROM wishlist WHERE user_id = ?) AS wishlist_count,
+              (SELECT COUNT(*) FROM reviews WHERE user_id = ?) AS review_count`, [id, id]);
+    const paid = orders.filter(o => o.status !== "Cancelled");
+    res.json({
+      ...rows[0], email_verified: !!Number(rows[0].email_verified), disabled: !!rows[0].disabled_at,
+      orders: orders.map(o => ({ ...o, item_count: Number(o.item_count) })),
+      addresses,
+      total_spent: Math.round(paid.reduce((s, o) => s + Number(o.total), 0) * 100) / 100,
+      wishlist_count: Number(counts.wishlist_count), review_count: Number(counts.review_count),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not fetch the customer." });
+  }
+});
+
+/* Account Controls (Milestone 6 - Phase 4). Disable or re-enable a customer.
+
+   There is deliberately NO delete here. `users` is the target of ON DELETE
+   CASCADE from `orders`, which cascades again to `order_items`, so deleting a
+   customer would destroy their entire commercial history. Disabling is the
+   reversible alternative and keeps every child row intact.
+
+   The write does three things atomically, and the third is the one that
+   matters: token_version is incremented ON DISABLE so every JWT issued before
+   this moment is permanently dead. It is NOT touched on re-enable, which is
+   what forces a re-enabled customer to log in again.
+
+   Status codes follow the admin convention: 400 for a malformed body, 404 for
+   a target that is not a customer, 409 for a request that is well formed but
+   refused. Never 403 - the admin portal's apiFetch reads 401/403 as an expired
+   session and would throw the operator out to the login page mid-action. */
+app.patch("/api/admin/customers/:id/disabled", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  const body = req.body || {};
+
+  if (typeof body.disabled !== "boolean") {
+    return res.status(400).json({ error: "disabled must be true or false.", field: "disabled" });
+  }
+  // Reason is optional and only meaningful when disabling. Plain text only:
+  // it is rendered to administrators with textContent, never as markup.
+  let reason = body.reason;
+  if (reason === null || reason === undefined) reason = "";
+  if (typeof reason !== "string") {
+    return res.status(400).json({ error: "reason must be text.", field: "reason" });
+  }
+  reason = reason.replace(/\s+/g, " ").trim();
+  if (reason.length > ACCOUNT_REASON_MAX) {
+    return res.status(400).json({ error: `reason must be ${ACCOUNT_REASON_MAX} characters or fewer.`, field: "reason" });
+  }
+
+  // Checked before the row is read so the message names the real objection.
+  if (id === Number(req.user.id)) {
+    return res.status(409).json({ error: "You cannot disable your own account.", code: "CANNOT_DISABLE_SELF" });
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.query(
+      "SELECT id, role, disabled_at, token_version FROM users WHERE id = ? FOR UPDATE", [id]);
+    if (!rows.length) {
+      await connection.rollback();
+      return res.status(404).json({ error: "Customer not found." });
+    }
+    if (rows[0].role !== "customer") {
+      await connection.rollback();
+      return res.status(409).json({ error: "Administrator accounts cannot be disabled here.", code: "CANNOT_DISABLE_ADMIN" });
+    }
+
+    if (body.disabled) {
+      // The version increment is the whole revocation mechanism. Same
+      // statement, same transaction: a disable that failed to bump the version
+      // would leave every outstanding token alive.
+      await connection.query(
+        "UPDATE users SET disabled_at = NOW(), disabled_reason = ?, token_version = token_version + 1 WHERE id = ?",
+        [reason || null, id]
+      );
+    } else {
+      // Re-enable CLEARS the reason. It describes why the account is currently
+      // disabled, so keeping it beside an active account would be stale and
+      // misleading; the next disable supplies its own. token_version is
+      // deliberately left alone - that is what keeps pre-disable tokens dead.
+      await connection.query(
+        "UPDATE users SET disabled_at = NULL, disabled_reason = NULL WHERE id = ?", [id]);
+    }
+
+    const [after] = await connection.query(
+      "SELECT disabled_at, disabled_reason, token_version FROM users WHERE id = ?", [id]);
+    await connection.commit();
+
+    const saved = after[0];
+    const disabled = saved.disabled_at !== null && saved.disabled_at !== undefined;
+    // Synchronous, post-commit, and seeded with the authoritative new state so
+    // the change survives a database failure immediately afterwards.
+    accounts.invalidateAccountStatus(id, { disabled, tokenVersion: Number(saved.token_version) || 0 });
+    console.warn(`Customer ${id} ${disabled ? "DISABLED" : "ENABLED"} by admin id ${req.user.id}.`);
+
+    res.json({
+      success: true,
+      id,
+      disabled,
+      disabled_at: saved.disabled_at,
+      disabled_reason: saved.disabled_reason,
+    });
+  } catch (err) {
+    await connection.rollback().catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: "Could not update the account." });
+  } finally {
+    connection.release();
+  }
+});
+
+// ---------- Admin: reviews ----------
+/* Recalculates a product's stored rating + count from its VISIBLE reviews only
+   (migration 004: hidden = 0).
+
+   This is the single source of truth for every path that can change a product's
+   rating, and it exists as one function on purpose: products.avg_rating and
+   products.review_count are STORED, and GET /api/products returns them with
+   SELECT *, so they reach every customer. If any one caller forgot the
+   "hidden = 0" predicate, a hidden review would keep shaping the public rating
+   with no visible symptom. Callers: customer review creation, admin delete,
+   admin hide, admin unhide.
+
+   Takes a connection so it can run inside the caller's transaction. */
+async function recalculateProductRating(connection, productId) {
+  const [[agg]] = await connection.query(
+    "SELECT AVG(rating) AS avgRating, COUNT(*) AS count FROM reviews WHERE product_id = ? AND hidden = 0",
+    [productId]
+  );
+  const avg = agg.avgRating === null ? 0 : Math.round(Number(agg.avgRating) * 10) / 10;
+  const count = Number(agg.count);
+  await connection.query("UPDATE products SET avg_rating = ?, review_count = ? WHERE id = ?", [avg, count, productId]);
+  return { avg_rating: avg, review_count: count };
+}
+
+app.get("/api/admin/reviews", requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT r.id, r.rating, r.comment, r.is_verified_purchase, r.hidden, r.created_at,
+              p.id AS product_id, p.name AS product_name, p.brand AS product_brand, p.image AS product_image,
+              (p.deleted_at IS NOT NULL) AS product_archived,
+              u.id AS customer_id, u.full_name AS customer_name, u.email AS customer_email
+         FROM reviews r
+         JOIN products p ON p.id = r.product_id
+         JOIN users u ON u.id = r.user_id
+        ORDER BY r.created_at DESC, r.id DESC`);
+    // Admins see every review, hidden included — moderation needs the full list.
+    res.json(rows.map(r => ({ ...r, is_verified_purchase: !!Number(r.is_verified_purchase), hidden: !!Number(r.hidden), product_archived: !!Number(r.product_archived) })));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not fetch reviews." });
+  }
+});
+
+/* Hide or unhide a review. Reversible moderation, as opposed to the permanent
+   delete below. Hiding changes what customers see AND the product's public
+   rating, so the flag flip and the recalculation happen in one transaction with
+   the row locked — the same shape the delete route uses. */
+app.patch("/api/admin/reviews/:id/hidden", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  const { hidden } = req.body || {};
+  if (typeof hidden !== "boolean") return res.status(400).json({ error: "hidden must be true or false.", field: "hidden" });
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.query("SELECT product_id FROM reviews WHERE id = ? FOR UPDATE", [id]);
+    if (!rows.length) { await connection.rollback(); return res.status(404).json({ error: "Review not found." }); }
+    const productId = rows[0].product_id;
+    await connection.query("UPDATE reviews SET hidden = ? WHERE id = ?", [hidden ? 1 : 0, id]);
+    const totals = await recalculateProductRating(connection, productId);
+    await connection.commit();
+    console.warn(`Review ${id} ${hidden ? "HIDDEN" : "UNHIDDEN"} by admin id ${req.user.id}.`);
+    res.json({ success: true, id, hidden, product_id: productId, ...totals });
+  } catch (err) {
+    await connection.rollback().catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: "Could not update the review." });
+  } finally {
+    connection.release();
+  }
+});
+
+// Permanently deletes a review and recalculates the product's rating + count.
+app.delete("/api/admin/reviews/:id", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.query("SELECT product_id FROM reviews WHERE id = ? FOR UPDATE", [id]);
+    if (!rows.length) { await connection.rollback(); return res.status(404).json({ error: "Review not found." }); }
+    const productId = rows[0].product_id;
+    await connection.query("DELETE FROM reviews WHERE id = ?", [id]);
+    const totals = await recalculateProductRating(connection, productId);
+    await connection.commit();
+    res.json({ success: true, product_id: productId, ...totals });
+  } catch (err) {
+    await connection.rollback();
+    console.error(err);
+    res.status(500).json({ error: "Could not delete the review." });
+  } finally {
+    connection.release();
   }
 });
 
@@ -630,10 +1482,12 @@ app.delete("/api/wishlist/:productId", requireAuth, async (req, res) => {
 // ---------- Reviews ----------
 app.get("/api/products/:id/reviews", async (req, res) => {
   try {
+    // hidden = 0 keeps moderated reviews out of the storefront entirely —
+    // neither the row nor its comment text reaches a customer (migration 004).
     const [rows] = await pool.query(
       `SELECT reviews.*, users.full_name FROM reviews
        JOIN users ON reviews.user_id = users.id
-       WHERE reviews.product_id = ?
+       WHERE reviews.product_id = ? AND reviews.hidden = 0
        ORDER BY reviews.created_at DESC`,
       [req.params.id]
     );
@@ -659,16 +1513,16 @@ app.post("/api/products/:id/reviews", requireAuth, async (req, res) => {
     );
     const isVerified = purchaseCheck.length > 0;
 
+    // Columns are enumerated explicitly and `hidden` is NOT among them, so a
+    // client-supplied hidden value can never be read or persisted here — only
+    // an admin can change visibility, via PATCH /api/admin/reviews/:id/hidden.
+    // Do not convert this to a spread or "SET ?" pattern.
     await pool.query(
       "INSERT INTO reviews (product_id, user_id, rating, comment, is_verified_purchase) VALUES (?, ?, ?, ?, ?)",
       [productId, req.user.id, rating, comment || null, isVerified]
     );
 
-    const [agg] = await pool.query(
-      "SELECT AVG(rating) AS avgRating, COUNT(*) AS count FROM reviews WHERE product_id = ?",
-      [productId]
-    );
-    await pool.query("UPDATE products SET avg_rating = ?, review_count = ? WHERE id = ?", [agg[0].avgRating, agg[0].count, productId]);
+    await recalculateProductRating(pool, productId);
 
     res.status(201).json({ success: true, isVerified });
   } catch (err) {
@@ -681,10 +1535,12 @@ app.post("/api/products/:id/reviews", requireAuth, async (req, res) => {
 app.get("/api/addresses", requireAuth, async (req, res) => {
   try {
     const [rows] = await pool.query(
-      "SELECT * FROM addresses WHERE user_id = ? ORDER BY is_default DESC, created_at DESC",
+      `SELECT a.*, EXISTS(SELECT 1 FROM orders o WHERE o.address_id = a.id) AS used_in_orders
+         FROM addresses a WHERE a.user_id = ? ORDER BY a.is_default DESC, a.created_at DESC`,
       [req.user.id]
     );
-    res.json(rows);
+    // locked: used by an order, so kept unchanged for order history (see PUT/DELETE below).
+    res.json(rows.map(({ used_in_orders, ...a }) => ({ ...a, locked: !!Number(used_in_orders) })));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Could not fetch addresses." });
@@ -713,19 +1569,261 @@ app.post("/api/addresses", requireAuth, async (req, res) => {
 });
 
 // ============================================================
+// ---------- Customer account (Milestone 4) ------------------
+// ============================================================
+// Every query here is scoped to req.user.id from the verified JWT — never to an
+// id supplied by the browser — so customers can only see and change their own data.
+
+// Small in-memory rate limiter (same approach as the password-reset limiter).
+function createRateLimiter({ windowMs, max }) {
+  const hits = new Map();
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, list] of hits) {
+      const fresh = list.filter(t => now - t < windowMs);
+      if (fresh.length) hits.set(key, fresh); else hits.delete(key);
+    }
+  }, windowMs).unref();
+  const recent = key => (hits.get(key) || []).filter(t => Date.now() - t < windowMs);
+  return {
+    // True if the key has already used up its allowance (records nothing).
+    isLimited(key) { return recent(key).length >= max; },
+    // Records one attempt for the key.
+    record(key) { const list = recent(key); list.push(Date.now()); hits.set(key, list); },
+    // Records an attempt and returns true when the key is over the limit.
+    limited(key) { this.record(key); return recent(key).length > max; },
+  };
+}
+
+const passwordChangeLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 5 });
+const trackOrderLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10 });
+
+const PHONE_PATTERN = /^[+0-9\s-]{7,20}$/;
+const MIN_PASSWORD_LENGTH = 6; // same rule as registration and password reset
+
+function isPositiveId(value) {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0;
+}
+
+function publicProfile(u) {
+  return {
+    id: u.id,
+    full_name: u.full_name,
+    email: u.email,
+    phone: u.phone || null,
+    role: u.role,
+    email_verified: !!u.email_verified_at,
+    member_since: u.created_at,
+    // Google-created accounts have no password the customer knows; they set one by email.
+    password_login: u.auth_provider !== "google",
+    google_linked: !!u.google_id,
+  };
+}
+
+async function loadProfile(userId) {
+  const [rows] = await pool.query(
+    "SELECT id, full_name, email, phone, role, created_at, email_verified_at, auth_provider, google_id FROM users WHERE id = ?",
+    [userId]
+  );
+  return rows[0] || null;
+}
+
+app.get("/api/me", requireAuth, async (req, res) => {
+  try {
+    const user = await loadProfile(req.user.id);
+    if (!user) return res.status(401).json({ error: "Your session has expired. Please log in again." });
+    res.json(publicProfile(user));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not load your profile." });
+  }
+});
+
+// Name and phone only. Email changes need re-verification and are out of scope.
+app.patch("/api/me", requireAuth, async (req, res) => {
+  const body = req.body || {};
+  const updates = [];
+  const values = [];
+  if ("fullName" in body) {
+    const name = String(body.fullName || "").trim();
+    if (name.length < 2 || name.length > 150) return res.status(400).json({ error: "Please enter your full name (2–150 characters).", field: "fullName" });
+    updates.push("full_name = ?"); values.push(name);
+  }
+  if ("phone" in body) {
+    const phone = String(body.phone || "").trim();
+    if (phone && !PHONE_PATTERN.test(phone)) return res.status(400).json({ error: "Please enter a valid phone number.", field: "phone" });
+    updates.push("phone = ?"); values.push(phone || null);
+  }
+  if ("email" in body) return res.status(400).json({ error: "Email addresses can't be changed here yet.", field: "email" });
+  if (!updates.length) return res.status(400).json({ error: "Nothing to update." });
+  try {
+    await pool.query(`UPDATE users SET ${updates.join(", ")} WHERE id = ?`, [...values, req.user.id]);
+    const user = await loadProfile(req.user.id);
+    res.json(publicProfile(user));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not update your profile." });
+  }
+});
+
+app.post("/api/me/password", requireAuth, async (req, res) => {
+  // Only wrong current-password attempts count, so typos in the new password never lock anyone out.
+  if (passwordChangeLimiter.isLimited(`user:${req.user.id}`)) {
+    return res.status(429).json({ error: "Too many attempts. Please wait a few minutes and try again.", code: "RATE_LIMITED" });
+  }
+  const { currentPassword, newPassword } = req.body || {};
+  if (typeof newPassword !== "string" || newPassword.length < MIN_PASSWORD_LENGTH) {
+    return res.status(400).json({ error: `Your new password must be at least ${MIN_PASSWORD_LENGTH} characters.`, field: "newPassword" });
+  }
+  if (newPassword.length > 200) return res.status(400).json({ error: "That password is too long.", field: "newPassword" });
+  try {
+    const [rows] = await pool.query("SELECT password_hash, auth_provider FROM users WHERE id = ?", [req.user.id]);
+    const user = rows[0];
+    if (!user) return res.status(401).json({ error: "Your session has expired. Please log in again." });
+    if (user.auth_provider === "google") {
+      return res.status(400).json({ error: "Your account uses Google sign-in. Set a password using the emailed link instead.", code: "PASSWORD_NOT_SET" });
+    }
+    if (typeof currentPassword !== "string" || !currentPassword) {
+      return res.status(400).json({ error: "Please enter your current password.", field: "currentPassword" });
+    }
+    const matches = await bcrypt.compare(currentPassword, user.password_hash);
+    if (!matches) {
+      passwordChangeLimiter.record(`user:${req.user.id}`);
+      return res.status(400).json({ error: "Your current password is incorrect.", field: "currentPassword" });
+    }
+    if (await bcrypt.compare(newPassword, user.password_hash)) {
+      return res.status(400).json({ error: "Choose a password you haven't used for this account.", field: "newPassword" });
+    }
+    const hash = await bcrypt.hash(newPassword, 10);
+    await pool.query("UPDATE users SET password_hash = ? WHERE id = ?", [hash, req.user.id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not change your password." });
+  }
+});
+
+/* ---------- Address management ----------
+   Orders reference addresses by id (there is no copy of the address on the
+   order, and deleting an address clears orders.address_id). To keep order
+   history accurate, an address that has been used for an order is locked:
+   it can still be set as default, but not edited or deleted. */
+function validateAddressBody(b) {
+  const v = k => String(b[k] || "").trim();
+  const addr = {
+    label: v("label").slice(0, 30) || "Home",
+    fullName: v("fullName"), phone: v("phone"),
+    addressLine1: v("addressLine1"), addressLine2: v("addressLine2"),
+    city: v("city"), region: v("region"), country: v("country"),
+  };
+  if (!addr.fullName || !addr.addressLine1 || !addr.city || !addr.country) return { error: "Full name, address, city, and country are required." };
+  if (addr.fullName.length > 150 || addr.addressLine1.length > 255 || addr.addressLine2.length > 255 || addr.city.length > 100 || addr.region.length > 100 || addr.country.length > 100) return { error: "One of the address fields is too long." };
+  if (addr.phone && !PHONE_PATTERN.test(addr.phone)) return { error: "Please enter a valid phone number." };
+  return { addr };
+}
+
+async function ownedAddress(addressId, userId) {
+  if (!isPositiveId(addressId)) return null;
+  const [rows] = await pool.query(
+    `SELECT a.*, (SELECT COUNT(*) FROM orders o WHERE o.address_id = a.id) AS order_count
+       FROM addresses a WHERE a.id = ? AND a.user_id = ?`,
+    [Number(addressId), userId]
+  );
+  return rows[0] || null;
+}
+
+app.put("/api/addresses/:id", requireAuth, async (req, res) => {
+  try {
+    const existing = await ownedAddress(req.params.id, req.user.id);
+    if (!existing) return res.status(404).json({ error: "Address not found." });
+    if (Number(existing.order_count) > 0) {
+      return res.status(409).json({ error: "This address was used for an order, so it's kept as it is for your records. Add a new address instead.", code: "ADDRESS_LOCKED" });
+    }
+    const { addr, error } = validateAddressBody(req.body || {});
+    if (error) return res.status(400).json({ error });
+    await pool.query(
+      `UPDATE addresses SET label=?, full_name=?, phone=?, address_line1=?, address_line2=?, city=?, region=?, country=?
+        WHERE id = ? AND user_id = ?`,
+      [addr.label, addr.fullName, addr.phone || null, addr.addressLine1, addr.addressLine2 || null, addr.city, addr.region || null, addr.country, existing.id, req.user.id]
+    );
+    if (req.body && req.body.isDefault) {
+      await pool.query("UPDATE addresses SET is_default = (id = ?) WHERE user_id = ?", [existing.id, req.user.id]);
+    }
+    res.json({ success: true, id: existing.id });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not update the address." });
+  }
+});
+
+app.delete("/api/addresses/:id", requireAuth, async (req, res) => {
+  try {
+    const existing = await ownedAddress(req.params.id, req.user.id);
+    if (!existing) return res.status(404).json({ error: "Address not found." });
+    if (Number(existing.order_count) > 0) {
+      return res.status(409).json({ error: "This address was used for an order, so it's kept for your records and can't be removed.", code: "ADDRESS_LOCKED" });
+    }
+    await pool.query("DELETE FROM addresses WHERE id = ? AND user_id = ?", [existing.id, req.user.id]);
+    // If the default was removed, make the most recent remaining address the default.
+    if (existing.is_default) {
+      await pool.query(
+        "UPDATE addresses SET is_default = TRUE WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+        [req.user.id]
+      );
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not remove the address." });
+  }
+});
+
+app.patch("/api/addresses/:id/default", requireAuth, async (req, res) => {
+  try {
+    const existing = await ownedAddress(req.params.id, req.user.id);
+    if (!existing) return res.status(404).json({ error: "Address not found." });
+    await pool.query("UPDATE addresses SET is_default = (id = ?) WHERE user_id = ?", [existing.id, req.user.id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not update your default address." });
+  }
+});
+
+// ============================================================
 // ---------- Email Verification (real, email-based flow) -----
 // ============================================================
 
 const VERIFY_TOKEN_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
 
+// Mail-server (MX) check at registration. Only a definitive DNS answer that the
+// domain has no mail server rejects the address. If the lookup itself fails
+// (resolver unreachable, timeout, temporary failure) the address is allowed and
+// a warning is logged — the verification email is the real proof of ownership.
+const MX_LOOKUP_TIMEOUT_MS = 3000;
+const MX_DEFINITIVE_NO_MAIL = new Set(["ENOTFOUND", "ENODATA"]); // domain doesn't exist / has no MX records
+
 async function domainHasMailServer(email) {
   const domain = (email || "").split("@")[1];
   if (!domain) return false;
+  const resolver = new dns.Resolver({ timeout: MX_LOOKUP_TIMEOUT_MS, tries: 1 });
+  let timer;
   try {
-    const records = await dns.resolveMx(domain);
+    const records = await Promise.race([
+      resolver.resolveMx(domain),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(Object.assign(new Error("MX lookup timed out"), { code: "ETIMEOUT" })), MX_LOOKUP_TIMEOUT_MS + 500);
+      }),
+    ]);
     return Array.isArray(records) && records.length > 0;
   } catch (err) {
-    return false;
+    if (MX_DEFINITIVE_NO_MAIL.has(err.code)) return false;
+    resolver.cancel();
+    console.warn(`MX lookup for "${domain}" could not be completed (${err.code || err.message}); allowing registration — email verification still required.`);
+    return true;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -923,12 +2021,23 @@ app.post("/api/forgot-password", async (req, res) => {
   recordEmailCooldown(email);
 
   try {
-    const [users] = await pool.query("SELECT id, full_name FROM users WHERE email = ?", [email]);
+    const [users] = await pool.query("SELECT id, full_name, disabled_at FROM users WHERE email = ?", [email]);
     if (users.length === 0) {
       return res.json(GENERIC);
     }
 
     const user = users[0];
+
+    // Account Controls: a disabled account gets the SAME generic response, so
+    // this endpoint still cannot be used to discover whether an account exists
+    // or what state it is in. It simply stops here: no reset row is written and
+    // no email is sent. Completing a reset would be pointless (the customer
+    // still cannot sign in) and not harmless - POST /api/reset-password also
+    // rewrites auth_provider to 'local', which is a state change on a
+    // suspended account.
+    if (user.disabled_at) {
+      return res.json(GENERIC);
+    }
 
     await pool.query("DELETE FROM password_resets WHERE user_id = ? AND used_at IS NULL", [user.id]);
 
@@ -999,7 +2108,8 @@ app.post("/api/reset-password", async (req, res) => {
     const resetRecord = rows[0];
     const passwordHash = await bcrypt.hash(password, 10);
 
-    await pool.query("UPDATE users SET password_hash = ? WHERE id = ?", [passwordHash, resetRecord.user_id]);
+    // After a reset the customer knows their password, so password sign-in (and changes) apply.
+    await pool.query("UPDATE users SET password_hash = ?, auth_provider = 'local' WHERE id = ?", [passwordHash, resetRecord.user_id]);
 
     await pool.query("UPDATE password_resets SET used_at = NOW() WHERE id = ?", [resetRecord.id]);
     await pool.query("DELETE FROM password_resets WHERE user_id = ? AND used_at IS NULL", [resetRecord.user_id]);
@@ -1012,203 +2122,393 @@ app.post("/api/reset-password", async (req, res) => {
 });
 
 // ---------- Coupons ----------
-app.post("/api/coupons/validate", async (req, res) => {
-  const { code } = req.body;
-  if (!code) return res.status(400).json({ error: "Coupon code is required." });
+// POST /api/coupons/validate was removed (Milestone 6, promo management). It had no
+// caller in the frontend or the test suites, and its expiry check disagreed with the
+// authoritative one: it compared against the Node process clock with "<", while
+// pricing.js loadCoupon() compares against the database clock with "<=", so a coupon
+// expiring at that instant was valid here and expired there. It also used SELECT *,
+// which would have silently picked up the new `active` column without honouring it.
+// POST /api/cart/quote is the single authoritative coupon path.
 
+// ---------- Cart quote + Payments (Paystack) ----------
+// Every amount comes from pricing.js (server-side, integer pesewas). Prices or
+// totals sent by the browser are never trusted.
+const PAYSTACK_API_BASE = process.env.PAYSTACK_API_BASE || "https://api.paystack.co";
+const PAYMENT_REFERENCE_PATTERN = /^NF-[A-Za-z0-9-]{8,80}$/;
+
+function sendPricingError(res, err) {
+  if (!(err instanceof PricingError)) return false;
+  res.status(err.status).json({ error: err.message, code: err.code, ...err.details });
+  return true;
+}
+
+// Public, read-only: prices a cart so the storefront shows the server's numbers.
+app.post("/api/cart/quote", async (req, res) => {
   try {
-    const [rows] = await pool.query("SELECT * FROM coupons WHERE code = ?", [code.toUpperCase()]);
-    if (rows.length === 0) return res.status(404).json({ error: "Invalid coupon code." });
-
-    const coupon = rows[0];
-    if (coupon.expires_at && new Date(coupon.expires_at) < new Date()) {
-      return res.status(400).json({ error: "This coupon has expired." });
-    }
-    if (coupon.usage_limit !== null && coupon.times_used >= coupon.usage_limit) {
-      return res.status(400).json({ error: "This coupon has reached its usage limit." });
-    }
-
-    res.json({
-      id: coupon.id,
-      code: coupon.code,
-      discountPercent: coupon.discount_percent,
-      discountAmount: coupon.discount_amount,
-    });
+    const { items, couponId, couponCode } = req.body || {};
+    const pricing = await priceCart(pool, { items, couponId, couponCode });
+    res.json(quoteForClient(pricing));
   } catch (err) {
+    if (sendPricingError(res, err)) return;
     console.error(err);
-    res.status(500).json({ error: "Could not validate coupon." });
+    res.status(500).json({ error: "Could not price your cart." });
   }
 });
 
-// ---------- Payments (Paystack) ----------
 app.post("/api/payments/initialize", requireAuth, async (req, res) => {
-  const { items, addressId, couponId } = req.body;
-
-  if (!Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ error: "Your cart is empty." });
-  }
-
+  const { items, addressId, couponId } = req.body || {};
   try {
+    if (!process.env.PAYSTACK_SECRET_KEY) {
+      return res.status(503).json({ error: "Payments are not available right now.", code: "PAYMENTS_NOT_CONFIGURED" });
+    }
     const [userRows] = await pool.query("SELECT email FROM users WHERE id = ?", [req.user.id]);
     if (userRows.length === 0) return res.status(404).json({ error: "User not found." });
-    const email = userRows[0].email;
 
-    const ids = items.map(i => i.productId);
-    const [products] = await pool.query(
-      `SELECT id, price, stock_qty FROM products WHERE id IN (?) AND deleted_at IS NULL`,
-      [ids]
-    );
-
-    let total = 0;
-    for (const item of items) {
-      const product = products.find(p => p.id === item.productId);
-      if (!product) return res.status(400).json({ error: "One of the items in your cart is no longer available." });
-      if (product.stock_qty < item.qty) return res.status(400).json({ error: "Not enough stock for one of the items in your cart." });
-      total += Number(product.price) * item.qty;
-    }
-
-    let discount = 0;
-    if (couponId) {
-      const [couponRows] = await pool.query("SELECT * FROM coupons WHERE id = ?", [couponId]);
-      if (couponRows.length > 0) {
-        const c = couponRows[0];
-        if (c.discount_percent) discount = total * (Number(c.discount_percent) / 100);
-        else if (c.discount_amount) discount = Number(c.discount_amount);
-        discount = Math.min(discount, total);
+    // A delivery address, when given, must belong to this customer.
+    let validAddressId = null;
+    if (addressId !== undefined && addressId !== null && addressId !== "") {
+      const [addr] = await pool.query("SELECT id FROM addresses WHERE id = ? AND user_id = ?", [Number(addressId) || 0, req.user.id]);
+      if (addr.length === 0) {
+        return res.status(400).json({ error: "Please choose one of your saved delivery addresses.", code: "INVALID_ADDRESS" });
       }
+      validAddressId = addr[0].id;
     }
 
-    // Shipping fee is intentionally still applied here — the shipping-fee
-    // fix has been held off for now at the site owner's request.
-    const shipping = total > 0 ? 8 : 0;
-    const finalTotal = total - discount + shipping;
-    const reference = `NF-${Date.now()}-${req.user.id}`;
+    const pricing = await priceCart(pool, { items, couponId });
+    const reference = `NF-${Date.now()}-${req.user.id}-${crypto.randomBytes(4).toString("hex")}`;
 
-    const paystackRes = await fetch("https://api.paystack.co/transaction/initialize", {
+    // Signed snapshot of exactly what is being charged; verification creates the order from it.
+    const snapshot = {
+      v: 1,
+      reference,
+      userId: req.user.id,
+      addressId: validAddressId,
+      couponId: pricing.coupon ? pricing.coupon.id : null,
+      currency: pricing.currency,
+      subtotal: pricing.subtotal,
+      discount: pricing.discount,
+      shipping: pricing.shipping,
+      total: pricing.total,
+      lines: pricing.lines.map(l => ({ productId: l.productId, qty: l.qty, offerId: l.offerId, unitPrice: l.unitPrice, name: l.name })),
+    };
+    const { payload, sig } = signSnapshot(snapshot);
+
+    const paystackRes = await fetch(`${PAYSTACK_API_BASE}/transaction/initialize`, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        email,
-        amount: Math.round(finalTotal * 100), // Paystack expects the smallest currency unit (pesewas)
+        email: userRows[0].email,
+        amount: pricing.total,              // integer pesewas, calculated by the server
+        currency: pricing.currency,
         reference,
         callback_url: `${process.env.FRONTEND_URL}/payment-callback.html`,
-        metadata: { userId: req.user.id, items, addressId: addressId || null, couponId: couponId || null },
+        metadata: { nf_order: payload, nf_sig: sig },
       }),
     });
-    const paystackData = await paystackRes.json();
-    if (!paystackData.status) {
-      return res.status(500).json({ error: paystackData.message || "Could not start payment." });
+    const paystackData = await paystackRes.json().catch(() => ({}));
+    if (!paystackRes.ok || !paystackData.status || !paystackData.data?.authorization_url) {
+      console.error("Paystack initialize failed:", paystackRes.status, paystackData.message);
+      return res.status(502).json({ error: "We couldn't start the payment. Please try again.", code: "PAYSTACK_INIT_FAILED" });
     }
 
-    res.json({ authorizationUrl: paystackData.data.authorization_url, reference });
+    res.json({ authorizationUrl: paystackData.data.authorization_url, reference, quote: quoteForClient(pricing) });
   } catch (err) {
+    if (sendPricingError(res, err)) return;
     console.error(err);
     res.status(500).json({ error: "Could not initialize payment." });
   }
 });
 
-app.get("/api/payments/verify/:reference", requireAuth, async (req, res) => {
-  const { reference } = req.params;
+// A duplicate key on uq_orders_payment_reference (migration 001) means this payment
+// reference has already been turned into an order. That is the one duplicate we expect
+// here, and it is recoverable: the caller just needs the existing order. Any other
+// duplicate-key error is unexpected and must keep its normal failure handling, so the
+// index name is matched explicitly. TiDB reports the key as "orders.uq_..." and MariaDB
+// as "uq_...", hence the substring test.
+function isDuplicatePaymentReference(err) {
+  return !!err
+    && (err.code === "ER_DUP_ENTRY" || err.errno === 1062)
+    && typeof err.sqlMessage === "string"
+    && err.sqlMessage.includes("uq_orders_payment_reference");
+}
+
+/* ---------- Shared settlement path ----------
+   Everything from "ask Paystack what actually happened" to "the order exists".
+   The browser callback (/api/payments/verify) and the Paystack webhook both go
+   through here, so the two cannot drift apart. It returns an outcome instead of
+   throwing or writing a response, because the callers answer very differently:
+   the callback speaks JSON to a browser, the webhook speaks status codes to
+   Paystack. requireUserId is the one browser-only safeguard — the webhook has no
+   session, and authenticates the payment through the signed snapshot plus the
+   server-to-server verification below. */
+async function settlePayment(reference, { requireUserId = null } = {}) {
+  const reject = (status, code, error, details) => ({ outcome: "rejected", status, code, error, details });
+  const lockName = `nf_pay_${reference}`.slice(0, 64);
+  let connection = null;
+  let lockHeld = false;
 
   try {
-    const verifyRes = await fetch(`https://api.paystack.co/transaction/verify/${reference}`, {
+    if (!process.env.PAYSTACK_SECRET_KEY) return { outcome: "unavailable" };
+
+    // 1. Ask Paystack directly (server-to-server) what was actually charged.
+    const verifyRes = await fetch(`${PAYSTACK_API_BASE}/transaction/verify/${encodeURIComponent(reference)}`, {
       headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
     });
-    const verifyData = await verifyRes.json();
-
-    if (!verifyData.status || verifyData.data.status !== "success") {
-      return res.status(400).json({ error: "Payment was not successful." });
+    const verifyData = await verifyRes.json().catch(() => ({}));
+    const tx = verifyData && verifyData.data;
+    if (!verifyData.status || !tx || tx.status !== "success") {
+      return reject(400, "PAYMENT_NOT_SUCCESSFUL", "Payment was not successful.");
+    }
+    if (tx.reference !== reference) {
+      return reject(400, "REFERENCE_MISMATCH", "Payment reference mismatch.");
+    }
+    if (tx.currency !== CURRENCY) {
+      console.error("Payment currency mismatch:", reference, tx.currency);
+      return reject(400, "CURRENCY_MISMATCH", "Payment currency mismatch.");
     }
 
-    const [existing] = await pool.query("SELECT id, total FROM orders WHERE payment_reference = ?", [reference]);
+    // 2. The signed order snapshot created at initialization.
+    let meta = tx.metadata;
+    if (typeof meta === "string") { try { meta = JSON.parse(meta); } catch (e) { meta = null; } }
+    const snapshot = meta ? readSignedSnapshot(meta.nf_order, meta.nf_sig) : null;
+    if (!snapshot || snapshot.reference !== reference || !Array.isArray(snapshot.lines) || snapshot.lines.length === 0) {
+      console.error("Payment metadata missing or tampered:", reference);
+      return reject(400, "PAYMENT_METADATA_INVALID", "This payment could not be matched to an order.", { reference });
+    }
+    // Browser flow only: the signed-in customer must be the one who paid.
+    if (requireUserId !== null && Number(snapshot.userId) !== Number(requireUserId)) {
+      return reject(403, "PAYMENT_USER_MISMATCH", "This payment belongs to a different account.");
+    }
+    if (Number(tx.amount) !== Number(snapshot.total)) {
+      console.error("PAYMENT AMOUNT MISMATCH:", reference, "charged", tx.amount, "expected", snapshot.total);
+      return reject(400, "AMOUNT_MISMATCH", "The amount paid does not match your order. Please contact us with your payment reference.", { reference });
+    }
+
+    // 3. One order per reference: serialize concurrent settlements of the same payment.
+    connection = await pool.getConnection();
+    const [[lock]] = await connection.query("SELECT GET_LOCK(?, 10) AS got", [lockName]);
+    if (Number(lock.got) !== 1) return { outcome: "busy" };
+    lockHeld = true;
+
+    const [existing] = await connection.query("SELECT id, total FROM orders WHERE payment_reference = ?", [reference]);
     if (existing.length > 0) {
-      return res.json({ orderId: existing[0].id, total: existing[0].total, alreadyProcessed: true });
+      return { outcome: "already_processed", orderId: existing[0].id, total: Number(existing[0].total) };
     }
 
-    const { items, addressId, couponId, userId } = verifyData.data.metadata;
-    const connection = await pool.getConnection();
+    // 4. Create the order from the snapshot. Stock is only decremented if enough remains.
+    let orderId;
+    await connection.beginTransaction();
     try {
-      await connection.beginTransaction();
-
-      const ids = items.map(i => i.productId);
-      const [products] = await connection.query(
-        `SELECT id, name, price, stock_qty FROM products WHERE id IN (?) AND deleted_at IS NULL`,
-        [ids]
-      );
-
-      let total = 0;
-      const itemDetails = [];
-      for (const item of items) {
-        const product = products.find(p => Number(p.id) === Number(item.productId));
-        if (!product) {
-          console.error("Product mismatch — item.productId:", item.productId, "available product IDs:", products.map(p => p.id));
-          throw new Error("One of the items in your order is no longer available.");
-        }
-        total += Number(product.price) * item.qty;
-        itemDetails.push({ productId: item.productId, qty: item.qty, price: product.price, name: product.name });
-      }
-
-      let discount = 0;
-      let appliedCoupon = null;
-      if (couponId) {
-        const [couponRows] = await connection.query("SELECT * FROM coupons WHERE id = ?", [couponId]);
-        if (couponRows.length > 0) {
-          appliedCoupon = couponRows[0];
-          if (appliedCoupon.discount_percent) discount = total * (Number(appliedCoupon.discount_percent) / 100);
-          else if (appliedCoupon.discount_amount) discount = Number(appliedCoupon.discount_amount);
-          discount = Math.min(discount, total);
+      for (const line of snapshot.lines) {
+        const [result] = await connection.query(
+          "UPDATE products SET stock_qty = stock_qty - ? WHERE id = ? AND deleted_at IS NULL AND stock_qty >= ?",
+          [line.qty, line.productId, line.qty]
+        );
+        if (result.affectedRows !== 1) {
+          throw new PricingError(409, "PAID_OUT_OF_STOCK", "Out of stock after payment.", { productId: line.productId });
         }
       }
-      const finalTotal = total - discount;
-
       const [orderResult] = await connection.query(
         "INSERT INTO orders (user_id, address_id, coupon_id, total, status, payment_reference) VALUES (?, ?, ?, ?, 'Processing', ?)",
-        [userId, addressId || null, couponId || null, finalTotal, reference]
+        [snapshot.userId, snapshot.addressId, snapshot.couponId, toCedis(snapshot.total), reference]
       );
-      const orderId = orderResult.insertId;
-
-      for (const item of itemDetails) {
+      orderId = orderResult.insertId;
+      for (const line of snapshot.lines) {
         await connection.query(
           "INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase) VALUES (?, ?, ?, ?)",
-          [orderId, item.productId, item.qty, item.price]
+          [orderId, line.productId, line.qty, toCedis(line.unitPrice)]
         );
-        await connection.query("UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?", [item.qty, item.productId]);
       }
-
-      if (appliedCoupon) {
-        await connection.query("UPDATE coupons SET times_used = times_used + 1 WHERE id = ?", [appliedCoupon.id]);
-      }
-
-      await connection.commit();
-
-      try {
-        const [userRows] = await pool.query("SELECT full_name, email FROM users WHERE id = ?", [userId]);
-        if (userRows.length > 0) {
-          await sendOrderConfirmation({
-            to: userRows[0].email,
-            customerName: userRows[0].full_name,
-            orderId,
-            items: itemDetails,
-            total: finalTotal,
-          });
+      if (snapshot.couponId) {
+        // Conditional increment: the quote-time check in pricing.js loadCoupon() is a
+        // read, and the advisory lock above is keyed per payment reference, so two
+        // settlements using the SAME coupon under DIFFERENT references run concurrently.
+        // An unconditional "+ 1" therefore let a 1-use coupon be redeemed twice. The
+        // predicate makes the limit an atomic check-and-increment, exactly as the stock
+        // decrement above does with "stock_qty >= ?".
+        const [couponResult] = await connection.query(
+          "UPDATE coupons SET times_used = times_used + 1 WHERE id = ? AND (usage_limit IS NULL OR times_used < usage_limit)",
+          [snapshot.couponId]
+        );
+        if (couponResult.affectedRows !== 1) {
+          throw new PricingError(409, "COUPON_USED_UP", "This coupon has reached its usage limit.");
         }
-      } catch (emailErr) {
-        console.error("Order confirmation email failed to send:", emailErr);
       }
-
-      res.status(201).json({ orderId, total: finalTotal });
+      await connection.commit();
     } catch (err) {
       await connection.rollback();
       throw err;
-    } finally {
+    }
+
+    // Confirmation email, best effort. Only the call that actually created the order
+    // gets here, so a replay or a second delivery never emails the customer twice.
+    try {
+      const [userRows] = await pool.query("SELECT full_name, email FROM users WHERE id = ?", [snapshot.userId]);
+      if (userRows.length > 0) {
+        await sendOrderConfirmation({
+          to: userRows[0].email,
+          customerName: userRows[0].full_name,
+          orderId,
+          items: snapshot.lines.map(l => ({ name: l.name, qty: l.qty, price: toCedis(l.unitPrice) })),
+          subtotal: toCedis(snapshot.subtotal),
+          discount: toCedis(snapshot.discount),
+          shipping: toCedis(snapshot.shipping),
+          total: toCedis(snapshot.total),
+        });
+      }
+    } catch (emailErr) {
+      console.error("Order confirmation email failed to send:", emailErr);
+    }
+
+    return { outcome: "created", orderId, total: toCedis(snapshot.total) };
+  } catch (err) {
+    if (err instanceof PricingError && err.code === "PAID_OUT_OF_STOCK") {
+      console.error("PAID BUT OUT OF STOCK — needs manual resolution:", reference, err.details);
+      return { outcome: "out_of_stock", code: err.code, details: err.details };
+    }
+    if (err instanceof PricingError) {
+      return { outcome: "rejected", status: err.status, code: err.code, error: err.message, details: err.details };
+    }
+    // The UNIQUE index rejected a second order for this reference, so a concurrent
+    // settlement won the race. The transaction above has already rolled back: no
+    // stock was taken and no partial order remains. Answer exactly as the pre-insert
+    // idempotency check does, so the loser of the race still sees the order.
+    if (isDuplicatePaymentReference(err)) {
+      console.error("Duplicate payment reference blocked by uq_orders_payment_reference — the advisory lock was bypassed:", reference);
+      try {
+        const [dupRows] = await pool.query("SELECT id, total FROM orders WHERE payment_reference = ?", [reference]);
+        if (dupRows.length > 0) {
+          return { outcome: "already_processed", orderId: dupRows[0].id, total: Number(dupRows[0].total) };
+        }
+      } catch (lookupErr) {
+        console.error("Could not re-read the order after a duplicate reference:", lookupErr);
+      }
+      // No order to return — the competing transaction rolled back too, or the
+      // re-read failed. Fall through to the transient failure below.
+    }
+    return { outcome: "error", err };
+  } finally {
+    if (connection) {
+      if (lockHeld) await connection.query("SELECT RELEASE_LOCK(?)", [lockName]).catch(() => {});
       connection.release();
     }
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message || "Could not verify payment." });
+  }
+}
+
+// Paystack signs the raw request body with HMAC-SHA512 keyed on the secret key and
+// sends the hex digest as x-paystack-signature. The comparison is constant time and
+// runs against the bytes as received: JSON.stringify(req.body) would reorder keys and
+// drop whitespace, producing a different digest for a byte-identical payload.
+function verifyPaystackSignature(req) {
+  const header = req.get("x-paystack-signature");
+  if (typeof header !== "string" || !/^[a-f0-9]{128}$/i.test(header)) return false;
+  if (!Buffer.isBuffer(req.rawBody) || req.rawBody.length === 0) return false;
+  const expected = crypto.createHmac("sha512", process.env.PAYSTACK_SECRET_KEY).update(req.rawBody).digest();
+  const given = Buffer.from(header, "hex");
+  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+}
+
+// Only unsigned or forged calls count against this limit, so a flood of junk can
+// never throttle a genuine Paystack delivery.
+const paymentWebhookLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 20 });
+
+/* Account Controls: this is the ONE route that accepts a disabled account, and
+   the only user of requireAuthAllowDisabled. The customer has already been
+   charged by Paystack; refusing to settle would take their money and give them
+   no order, no stock reservation and no confirmation email, leaving the
+   reference stranded. Maintenance mode bypasses this route for the same reason.
+
+   It also accepts a token whose version is stale, because the disable itself
+   invalidated the token the customer was holding when they paid.
+
+   Nothing is weakened by this. The JWT still establishes identity, and every
+   other safeguard is untouched: settlePayment re-verifies the transaction with
+   Paystack server-to-server, requires the HMAC-signed snapshot, requires
+   snapshot.userId to equal this caller, matches the amount, and is idempotent
+   per reference. A disabled customer can settle only a payment they personally
+   made and were actually charged for. They still cannot INITIALIZE a new one -
+   that route uses plain requireAuth. */
+app.get("/api/payments/verify/:reference", requireAuthAllowDisabled, async (req, res) => {
+  const { reference } = req.params;
+  if (!PAYMENT_REFERENCE_PATTERN.test(reference)) {
+    return res.status(400).json({ error: "Invalid payment reference.", code: "INVALID_REFERENCE" });
+  }
+  const result = await settlePayment(reference, { requireUserId: req.user.id });
+  switch (result.outcome) {
+    case "created":
+      return res.status(201).json({ orderId: result.orderId, total: result.total });
+    case "already_processed":
+      return res.json({ orderId: result.orderId, total: result.total, alreadyProcessed: true });
+    case "rejected":
+      return res.status(result.status).json({ error: result.error, code: result.code, ...(result.details || {}) });
+    case "out_of_stock":
+      return res.status(409).json({
+        error: "Your payment was received, but an item sold out before we could reserve it. Please contact us with your payment reference and we'll resolve it.",
+        code: result.code, reference,
+      });
+    case "busy":
+      return res.status(503).json({ error: "Your payment is being confirmed. Please refresh in a moment.", code: "VERIFY_BUSY" });
+    case "unavailable":
+      return res.status(503).json({ error: "Payments are not available right now.", code: "PAYMENTS_NOT_CONFIGURED" });
+    default:
+      console.error(result.err);
+      return res.status(500).json({ error: "We couldn't confirm your payment. If you were charged, please contact us with your payment reference.", reference });
+  }
+});
+
+/* Paystack webhook. Public by necessity — Paystack holds no session with us — so the
+   signature over the raw body is the only thing that authenticates a caller. The
+   payload is treated as a notification and never as the source of truth: for
+   charge.success we take only the reference, and settlePayment re-verifies the
+   transaction with Paystack and builds the order from the signed snapshot.
+
+   The status codes drive Paystack's retry behaviour, so they are deliberate: 2xx for
+   "handled, or permanently unactionable", 5xx only for "try me again". */
+app.post(PAYMENT_WEBHOOK_PATH, async (req, res) => {
+  const limiterKey = `webhook:${req.ip}`;
+  if (paymentWebhookLimiter.isLimited(limiterKey)) return res.status(429).end();
+
+  if (!process.env.PAYSTACK_SECRET_KEY) {
+    // Nothing can be authenticated without the key; let a real event come back later.
+    return res.status(503).json({ received: false, code: "PAYMENTS_NOT_CONFIGURED" });
+  }
+  if (!verifyPaystackSignature(req)) {
+    paymentWebhookLimiter.record(limiterKey);
+    console.error("Paystack webhook rejected: missing or invalid signature.");
+    return res.status(401).json({ received: false });
+  }
+
+  const event = req.body && typeof req.body === "object" ? req.body : null;
+  const type = event && typeof event.event === "string" ? event.event : "";
+  if (type !== "charge.success") {
+    return res.status(200).json({ received: true, ignored: type || "unknown_event" });
+  }
+
+  const reference = event.data && typeof event.data.reference === "string" ? event.data.reference.trim() : "";
+  if (!PAYMENT_REFERENCE_PATTERN.test(reference)) {
+    console.error("Paystack webhook: charge.success carried an unusable reference.");
+    return res.status(200).json({ received: true, ignored: "invalid_reference" });
+  }
+
+  const result = await settlePayment(reference, { requireUserId: null });
+  switch (result.outcome) {
+    case "created":
+      return res.status(200).json({ received: true, orderId: result.orderId });
+    case "already_processed":
+      return res.status(200).json({ received: true, orderId: result.orderId, alreadyProcessed: true });
+    case "out_of_stock":
+      console.error("WEBHOOK: paid but out of stock — needs manual resolution:", reference, result.details);
+      return res.status(200).json({ received: true, unresolved: result.code });
+    case "rejected":
+      console.error("WEBHOOK: charge.success could not be settled:", reference, result.code);
+      return res.status(200).json({ received: true, rejected: result.code });
+    case "busy":
+      return res.status(503).json({ received: false, code: "VERIFY_BUSY" });
+    case "unavailable":
+      return res.status(503).json({ received: false, code: "PAYMENTS_NOT_CONFIGURED" });
+    default:
+      console.error("WEBHOOK: settlement failed for", reference, result.err);
+      return res.status(500).json({ received: false });
   }
 });
 
@@ -1268,61 +2568,145 @@ app.get("/api/offers/active", async (req, res) => {
 });
 
 // ---------- Admin: all offers (any status), for the management table ----------
+// One entry per offer. Every product on it is in `products` (in the order the admin
+// added them); the first one is also mirrored into the older top-level product_* /
+// price fields so single-product consumers keep working.
 app.get("/api/admin/offers", requireAdmin, async (req, res) => {
   try {
     const [rows] = await pool.query(`
       SELECT offers.*,
              offer_products.original_price, offer_products.sale_price,
-             products.id AS product_id, products.name AS product_name, products.image AS product_image
+             products.id AS product_id, products.name AS product_name, products.image AS product_image,
+             products.brand AS product_brand, products.price AS product_price, products.stock_qty AS product_stock,
+             (products.deleted_at IS NOT NULL) AS product_archived
       FROM offers
       LEFT JOIN offer_products ON offer_products.offer_id = offers.id
       LEFT JOIN products ON offer_products.product_id = products.id
-      ORDER BY offers.display_order ASC, offers.created_at DESC
+      ORDER BY offers.display_order ASC, offers.created_at DESC, offers.id ASC, offer_products.id ASC
     `);
-    const withStatus = rows.map(o => attachOfferPricing({ ...o, status: computeOfferStatus(o) }));
-    res.json(withStatus);
+    const byId = new Map();
+    for (const row of rows) {
+      let offer = byId.get(row.id);
+      if (!offer) {
+        offer = attachOfferPricing({ ...row, product_archived: !!Number(row.product_archived), status: computeOfferStatus(row) });
+        offer.products = [];
+        byId.set(row.id, offer);
+      }
+      if (row.product_id !== null) {
+        offer.products.push(attachOfferPricing({
+          product_id: row.product_id, product_name: row.product_name, product_image: row.product_image,
+          product_brand: row.product_brand, product_price: row.product_price, product_stock: row.product_stock,
+          product_archived: !!Number(row.product_archived), original_price: row.original_price, sale_price: row.sale_price,
+        }));
+      }
+    }
+    res.json([...byId.values()].map(o => ({ ...o, product_count: o.products.length })));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Could not fetch offers." });
   }
 });
 
+const MAX_OFFER_PRODUCTS = 50;
+
+// The products on an offer arrive as items: [{ product_id, original_price, sale_price }].
+// The older single-product body (top-level product_id / original_price / sale_price) is
+// still accepted as a one-item list, and its errors keep their original field names.
+function offerItemsFromBody(body) {
+  if (body.items !== undefined) return { items: body.items, legacy: false };
+  return { items: [{ product_id: body.product_id, original_price: body.original_price, sale_price: body.sale_price }], legacy: true };
+}
+
+// Validates a full offer body (create + edit) and checks every product, all before any
+// write. existingProductIds: products already on the offer being edited — an archived
+// product may stay on an offer, it just can't be newly added. Returns { error, field } or { values }.
+async function validateOfferBody(body, existingProductIds = []) {
+  const title = adminText(body.title), description = adminText(body.description), badge = adminText(body.badge), image = adminText(body.image);
+  const offerType = adminText(body.offer_type) || "discount";
+  const displayOrder = body.display_order === undefined || body.display_order === "" ? 0 : Number(body.display_order);
+  const start = new Date(body.start_at), end = new Date(body.end_at);
+  const num = v => (typeof v === "boolean" || v === null || v === "" ? NaN : Number(v));
+  // At most 2 decimal places. n * 100 is compared with a small tolerance because floats
+  // can't hold most 2-dp prices exactly (289.15 * 100 === 28914.999999999996).
+  const money2 = n => Number.isFinite(n) && n > 0 && n <= 1000000 && Math.abs(n * 100 - Math.round(n * 100)) < 1e-6;
+  if (!title || title.length > 150) return { field: "title", error: "Title is required (up to 150 characters)." };
+  if (description.length > 2000) return { field: "description", error: "Description must be 2000 characters or fewer." };
+  if (!OFFER_TYPES.includes(offerType)) return { field: "offer_type", error: "Invalid offer type." };
+  if (badge.length > 40) return { field: "badge", error: "Badge must be 40 characters or fewer." };
+  if (image && !isValidImagePath(image)) return { field: "image", error: "Image must be a path inside images/." };
+  if (!body.start_at || !body.end_at || isNaN(start) || isNaN(end)) return { field: "start_at", error: "Start and end dates are required." };
+  if (end <= start) return { field: "end_at", error: "End date must be after the start date." };
+  if (!Number.isInteger(displayOrder) || displayOrder < 0 || displayOrder > 9999) return { field: "display_order", error: "Display order must be a whole number from 0 to 9999." };
+
+  const { items: raw, legacy } = offerItemsFromBody(body);
+  if (!Array.isArray(raw) || raw.length === 0) return { field: "items", error: "Add at least one product to the offer." };
+  if (raw.length > MAX_OFFER_PRODUCTS) return { field: "items", error: `An offer can include at most ${MAX_OFFER_PRODUCTS} products.` };
+  const field = (i, k) => (legacy ? k : `items[${i}].${k}`);
+  const items = [], seen = new Set();
+  for (let i = 0; i < raw.length; i++) {
+    const it = raw[i];
+    if (!it || typeof it !== "object") return { field: `items[${i}]`, error: "Each product needs a product, an original price and a sale price." };
+    const productId = num(it.product_id), original = num(it.original_price), sale = num(it.sale_price);
+    if (!Number.isInteger(productId) || productId <= 0) return { field: field(i, "product_id"), error: "Choose a product." };
+    if (seen.has(productId)) return { field: field(i, "product_id"), error: "That product is already in this offer." };
+    seen.add(productId);
+    if (!money2(original)) return { field: field(i, "original_price"), error: "Original price must be more than 0 with at most 2 decimal places." };
+    if (!money2(sale)) return { field: field(i, "sale_price"), error: "Sale price must be more than 0 with at most 2 decimal places." };
+    if (sale > original) return { field: field(i, "sale_price"), error: "Sale price cannot be higher than the original price." };
+    items.push({ product_id: productId, original_price: original, sale_price: sale });
+  }
+  const [products] = await pool.query("SELECT id, deleted_at FROM products WHERE id IN (?)", [items.map(it => it.product_id)]);
+  const productById = new Map(products.map(p => [Number(p.id), p]));
+  const kept = new Set(existingProductIds.map(Number));
+  for (let i = 0; i < items.length; i++) {
+    const p = productById.get(items[i].product_id);
+    if (!p) return { field: field(i, "product_id"), error: "That product doesn't exist." };
+    if (p.deleted_at && !kept.has(items[i].product_id)) return { field: field(i, "product_id"), error: "That product is archived. Restore it before putting it on offer." };
+  }
+  return { values: {
+    title, description: description || null, offer_type: offerType, badge: badge || null, image: image || null,
+    start_at: body.start_at, end_at: body.end_at, active: body.active === false ? 0 : 1, featured: body.featured ? 1 : 0,
+    display_order: displayOrder, items,
+  } };
+}
+
+// Inserts an offer's whole product set in one statement (inside the caller's transaction).
+function insertOfferProducts(connection, offerId, items) {
+  return connection.query(
+    `INSERT INTO offer_products (offer_id, product_id, original_price, sale_price) VALUES ?`,
+    [items.map(it => [offerId, it.product_id, it.original_price, it.sale_price])]
+  );
+}
+
+// Migration 007's UNIQUE (offer_id, product_id). Validation rejects duplicates first, so
+// this only fires if that check is ever bypassed. Matched by index name, as for orders.
+function isDuplicateOfferProduct(err) {
+  return !!err
+    && (err.code === "ER_DUP_ENTRY" || err.errno === 1062)
+    && typeof err.sqlMessage === "string"
+    && err.sqlMessage.includes("uq_offer_products_offer_product");
+}
+
 // ---------- Admin: create offer ----------
 app.post("/api/admin/offers", requireAdmin, async (req, res) => {
-  const {
-    title, description, offer_type, badge, image,
-    start_at, end_at, active, featured, display_order,
-    product_id, original_price, sale_price,
-  } = req.body;
-
-  if (!title || !start_at || !end_at || !product_id || original_price == null || sale_price == null) {
-    return res.status(400).json({ error: "Title, product, dates, and both prices are required." });
-  }
-  if (Number(sale_price) > Number(original_price)) {
-    return res.status(400).json({ error: "Sale price cannot be higher than the original price." });
-  }
-  if (new Date(end_at) <= new Date(start_at)) {
-    return res.status(400).json({ error: "End date must be after the start date." });
-  }
-
   const connection = await pool.getConnection();
   try {
+    const v = await validateOfferBody(req.body);
+    if (v.error) return res.status(400).json({ error: v.error, field: v.field });
+    const o = v.values;
     await connection.beginTransaction();
     const [offerResult] = await connection.query(
       `INSERT INTO offers (title, description, offer_type, badge, image, start_at, end_at, active, featured, display_order)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [title, description || null, offer_type || "discount", badge || null, image || null,
-       start_at, end_at, active === false ? 0 : 1, featured ? 1 : 0, display_order || 0]
+      [o.title, o.description, o.offer_type, o.badge, o.image, o.start_at, o.end_at, o.active, o.featured, o.display_order]
     );
     const offerId = offerResult.insertId;
-    await connection.query(
-      `INSERT INTO offer_products (offer_id, product_id, original_price, sale_price) VALUES (?, ?, ?, ?)`,
-      [offerId, product_id, original_price, sale_price]
-    );
+    await insertOfferProducts(connection, offerId, o.items);
     await connection.commit();
     res.status(201).json({ id: offerId });
   } catch (err) {
-    await connection.rollback();
+    await connection.rollback().catch(() => {});
+    if (isDuplicateOfferProduct(err)) return res.status(400).json({ error: "That product is already in this offer.", field: "items" });
     console.error(err);
     res.status(500).json({ error: "Could not create offer." });
   } finally {
@@ -1332,38 +2716,29 @@ app.post("/api/admin/offers", requireAdmin, async (req, res) => {
 
 // ---------- Admin: update offer ----------
 app.put("/api/admin/offers/:id", requireAdmin, async (req, res) => {
-  const {
-    title, description, offer_type, badge, image,
-    start_at, end_at, active, featured, display_order,
-    product_id, original_price, sale_price,
-  } = req.body;
-
-  if (Number(sale_price) > Number(original_price)) {
-    return res.status(400).json({ error: "Sale price cannot be higher than the original price." });
-  }
-  if (new Date(end_at) <= new Date(start_at)) {
-    return res.status(400).json({ error: "End date must be after the start date." });
-  }
-
+  const id = positiveIdParam(req, res); if (!id) return;
   const connection = await pool.getConnection();
   try {
+    const [current] = await pool.query("SELECT product_id FROM offer_products WHERE offer_id = ?", [id]);
+    const v = await validateOfferBody(req.body, current.map(r => r.product_id));
+    if (v.error) return res.status(400).json({ error: v.error, field: v.field });
+    const o = v.values;
     await connection.beginTransaction();
-    await connection.query(
+    const [result] = await connection.query(
       `UPDATE offers SET title=?, description=?, offer_type=?, badge=?, image=?, start_at=?, end_at=?, active=?, featured=?, display_order=? WHERE id=?`,
-      [title, description || null, offer_type || "discount", badge || null, image || null,
-       start_at, end_at, active === false ? 0 : 1, featured ? 1 : 0, display_order || 0, req.params.id]
+      [o.title, o.description, o.offer_type, o.badge, o.image, o.start_at, o.end_at, o.active, o.featured, o.display_order, id]
     );
-    // Single-product-per-offer for now (schema supports more later) —
-    // replace the offer's product/price row rather than trying to diff it.
-    await connection.query(`DELETE FROM offer_products WHERE offer_id = ?`, [req.params.id]);
-    await connection.query(
-      `INSERT INTO offer_products (offer_id, product_id, original_price, sale_price) VALUES (?, ?, ?, ?)`,
-      [req.params.id, product_id, original_price, sale_price]
-    );
+    if (!result.affectedRows) { await connection.rollback(); return res.status(404).json({ error: "Offer not found." }); }
+    // Replace the offer's whole product set rather than diffing it. The incoming set was
+    // fully validated above, and both statements share this transaction, so a failure
+    // leaves the previous products and prices exactly as they were.
+    await connection.query(`DELETE FROM offer_products WHERE offer_id = ?`, [id]);
+    await insertOfferProducts(connection, id, o.items);
     await connection.commit();
     res.json({ success: true });
   } catch (err) {
-    await connection.rollback();
+    await connection.rollback().catch(() => {});
+    if (isDuplicateOfferProduct(err)) return res.status(400).json({ error: "That product is already in this offer.", field: "items" });
     console.error(err);
     res.status(500).json({ error: "Could not update offer." });
   } finally {
@@ -1373,9 +2748,12 @@ app.put("/api/admin/offers/:id", requireAdmin, async (req, res) => {
 
 // ---------- Admin: activate/deactivate (toggle the manual "active" flag) ----------
 app.patch("/api/admin/offers/:id/toggle", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
   const { active } = req.body;
+  if (typeof active !== "boolean") return res.status(400).json({ error: "active must be true or false." });
   try {
-    await pool.query(`UPDATE offers SET active = ? WHERE id = ?`, [active ? 1 : 0, req.params.id]);
+    const [result] = await pool.query(`UPDATE offers SET active = ? WHERE id = ?`, [active ? 1 : 0, id]);
+    if (!result.affectedRows) return res.status(404).json({ error: "Offer not found." });
     res.json({ success: true });
   } catch (err) {
     console.error(err);
@@ -1383,18 +2761,363 @@ app.patch("/api/admin/offers/:id/toggle", requireAdmin, async (req, res) => {
   }
 });
 
-// ---------- Admin: delete offer ----------
-app.delete("/api/admin/offers/:id", requireAdmin, async (req, res) => {
+// ---------- Admin: feature/unfeature ----------
+app.patch("/api/admin/offers/:id/featured", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  const { featured } = req.body;
+  if (typeof featured !== "boolean") return res.status(400).json({ error: "featured must be true or false." });
   try {
-    await pool.query(`DELETE FROM offers WHERE id = ?`, [req.params.id]);
+    const [result] = await pool.query(`UPDATE offers SET featured = ? WHERE id = ?`, [featured ? 1 : 0, id]);
+    if (!result.affectedRows) return res.status(404).json({ error: "Offer not found." });
     res.json({ success: true });
   } catch (err) {
     console.error(err);
+    res.status(500).json({ error: "Could not update the offer." });
+  }
+});
+
+// ---------- Admin: delete offer ----------
+app.delete("/api/admin/offers/:id", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    await connection.query(`DELETE FROM offer_products WHERE offer_id = ?`, [id]);
+    const [result] = await connection.query(`DELETE FROM offers WHERE id = ?`, [id]);
+    if (!result.affectedRows) { await connection.rollback(); return res.status(404).json({ error: "Offer not found." }); }
+    await connection.commit();
+    res.json({ success: true });
+  } catch (err) {
+    await connection.rollback().catch(() => {});
+    console.error(err);
     res.status(500).json({ error: "Could not delete offer." });
+  } finally {
+    connection.release();
+  }
+});
+
+// ---------- Admin: coupons (promo codes) ----------
+// Status (Active / Inactive / Expired / Used up) is NEVER stored — it is derived at
+// read time from active, expires_at and times_used vs usage_limit, exactly as offer
+// status is. Expiry is evaluated in SQL ("expires_at <= NOW()") so it matches
+// pricing.js loadCoupon() byte for byte: the database clock is authoritative, never
+// the Node process clock. The precedence below is the same order loadCoupon() rejects
+// in, so the admin list never shows a state the customer wouldn't be told.
+
+const COUPON_CODE_PATTERN = /^[A-Z0-9_-]{1,50}$/;
+
+// A duplicate key on coupons.code means the admin reused an existing code. Matched as
+// a substring so TiDB (which reports "coupons.code") matches too, like the orders
+// duplicate-reference predicate above.
+function isDuplicateCouponCode(err) {
+  return !!err
+    && (err.code === "ER_DUP_ENTRY" || err.errno === 1062)
+    && typeof err.sqlMessage === "string"
+    && (err.sqlMessage.includes("coupons.code") || err.sqlMessage.includes("'code'"));
+}
+
+function computeCouponStatus(row) {
+  if (!Number(row.active)) return "Inactive";
+  if (Number(row.is_expired)) return "Expired";
+  if (row.usage_limit !== null && Number(row.times_used) >= Number(row.usage_limit)) return "Used up";
+  return "Active";
+}
+
+const COUPON_SELECT = `
+  SELECT coupons.id, coupons.code, coupons.discount_percent, coupons.discount_amount,
+         coupons.expires_at, coupons.usage_limit, coupons.times_used, coupons.active,
+         coupons.created_at, coupons.updated_at,
+         (coupons.expires_at IS NOT NULL AND coupons.expires_at <= NOW()) AS is_expired,
+         (SELECT COUNT(*) FROM orders WHERE orders.coupon_id = coupons.id) AS orders_used
+    FROM coupons`;
+
+function shapeCoupon(row) {
+  return {
+    id: row.id,
+    code: row.code,
+    discount_percent: row.discount_percent,
+    discount_amount: row.discount_amount,
+    expires_at: row.expires_at,
+    usage_limit: row.usage_limit === null ? null : Number(row.usage_limit),
+    times_used: Number(row.times_used),
+    active: !!Number(row.active),
+    orders_used: Number(row.orders_used),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    status: computeCouponStatus(row),
+  };
+}
+
+// Validates a full coupon body (create + edit). Returns { error, field } or { values }.
+// Exactly one discount kind is enforced here because the table carries no CHECK
+// constraint and TiDB's CHECK enforcement is version-gated.
+function validateCouponBody(body) {
+  const b = body || {};
+  const code = adminText(b.code).toUpperCase();
+  if (!code) return { field: "code", error: "A coupon code is required." };
+  if (code.length > 50) return { field: "code", error: "Coupon code must be 50 characters or fewer." };
+  if (!COUPON_CODE_PATTERN.test(code)) return { field: "code", error: "Use only letters, numbers, hyphens and underscores." };
+
+  const given = v => v !== undefined && v !== null && String(v).trim() !== "";
+  const hasPercent = given(b.discount_percent);
+  const hasAmount = given(b.discount_amount);
+  if (hasPercent && hasAmount) return { field: "discount_percent", error: "Choose either a percentage or a fixed amount, not both." };
+  if (!hasPercent && !hasAmount) return { field: "discount_percent", error: "Enter either a percentage or a fixed amount." };
+
+  const dec2 = n => Number.isFinite(n) && Math.round(n * 100) === n * 100;
+  let percent = null, amount = null;
+  if (hasPercent) {
+    percent = Number(b.discount_percent);
+    if (!Number.isFinite(percent) || percent <= 0) return { field: "discount_percent", error: "Percentage must be more than 0." };
+    if (percent > 100) return { field: "discount_percent", error: "Percentage cannot be more than 100." };
+    if (!dec2(percent)) return { field: "discount_percent", error: "Percentage can have at most 2 decimal places." };
+  } else {
+    amount = Number(b.discount_amount);
+    if (!Number.isFinite(amount) || amount <= 0) return { field: "discount_amount", error: "Amount must be more than 0." };
+    if (amount > 1000000) return { field: "discount_amount", error: "Amount is too large." };
+    if (!dec2(amount)) return { field: "discount_amount", error: "Amount can have at most 2 decimal places." };
+  }
+
+  let usageLimit = null;
+  if (given(b.usage_limit)) {
+    usageLimit = Number(b.usage_limit);
+    if (!Number.isInteger(usageLimit)) return { field: "usage_limit", error: "Usage limit must be a whole number." };
+    // 0 is rejected deliberately: it would make times_used >= usage_limit true at once,
+    // telling customers the coupon is "used up" instead of withdrawn. Use active=false.
+    if (usageLimit < 1) return { field: "usage_limit", error: "Usage limit must be at least 1 — deactivate the coupon instead." };
+    if (usageLimit > 1000000) return { field: "usage_limit", error: "Usage limit is too large." };
+  }
+
+  let expiresAt = null;
+  if (given(b.expires_at)) {
+    const raw = adminText(b.expires_at);
+    if (isNaN(new Date(raw).getTime())) return { field: "expires_at", error: "Enter a valid expiry date." };
+    expiresAt = raw;
+  }
+
+  return { values: {
+    code, discount_percent: percent, discount_amount: amount,
+    usage_limit: usageLimit, expires_at: expiresAt,
+    active: b.active === false ? 0 : 1,
+  } };
+}
+
+app.get("/api/admin/coupons", requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await pool.query(`${COUPON_SELECT} ORDER BY coupons.created_at DESC, coupons.id DESC`);
+    res.json(rows.map(shapeCoupon));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not fetch coupons." });
+  }
+});
+
+app.get("/api/admin/coupons/:id", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  try {
+    const [rows] = await pool.query(`${COUPON_SELECT} WHERE coupons.id = ?`, [id]);
+    if (!rows.length) return res.status(404).json({ error: "Coupon not found." });
+    res.json(shapeCoupon(rows[0]));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not fetch the coupon." });
+  }
+});
+
+app.post("/api/admin/coupons", requireAdmin, async (req, res) => {
+  const v = validateCouponBody(req.body);
+  if (v.error) return res.status(400).json({ error: v.error, field: v.field });
+  const c = v.values;
+  try {
+    const [result] = await pool.query(
+      `INSERT INTO coupons (code, discount_percent, discount_amount, expires_at, usage_limit, active)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [c.code, c.discount_percent, c.discount_amount, c.expires_at, c.usage_limit, c.active]
+    );
+    res.status(201).json({ id: result.insertId });
+  } catch (err) {
+    if (isDuplicateCouponCode(err)) {
+      return res.status(409).json({ error: "That coupon code already exists.", field: "code", code: "COUPON_CODE_TAKEN" });
+    }
+    console.error(err);
+    res.status(500).json({ error: "Could not create the coupon." });
+  }
+});
+
+app.put("/api/admin/coupons/:id", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  const v = validateCouponBody(req.body);
+  if (v.error) return res.status(400).json({ error: v.error, field: v.field });
+  const c = v.values;
+  try {
+    const [result] = await pool.query(
+      `UPDATE coupons SET code = ?, discount_percent = ?, discount_amount = ?,
+              expires_at = ?, usage_limit = ?, active = ? WHERE id = ?`,
+      [c.code, c.discount_percent, c.discount_amount, c.expires_at, c.usage_limit, c.active, id]
+    );
+    if (!result.affectedRows) {
+      const [exists] = await pool.query("SELECT id FROM coupons WHERE id = ?", [id]);
+      if (!exists.length) return res.status(404).json({ error: "Coupon not found." });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    if (isDuplicateCouponCode(err)) {
+      return res.status(409).json({ error: "That coupon code already exists.", field: "code", code: "COUPON_CODE_TAKEN" });
+    }
+    console.error(err);
+    res.status(500).json({ error: "Could not update the coupon." });
+  }
+});
+
+app.patch("/api/admin/coupons/:id/active", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  const { active } = req.body || {};
+  if (typeof active !== "boolean") return res.status(400).json({ error: "active must be true or false.", field: "active" });
+  try {
+    const [result] = await pool.query("UPDATE coupons SET active = ? WHERE id = ?", [active ? 1 : 0, id]);
+    if (!result.affectedRows) {
+      const [exists] = await pool.query("SELECT id FROM coupons WHERE id = ?", [id]);
+      if (!exists.length) return res.status(404).json({ error: "Coupon not found." });
+    }
+    res.json({ success: true, active });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not update the coupon." });
+  }
+});
+
+app.delete("/api/admin/coupons/:id", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    // orders.coupon_id is ON DELETE SET NULL, so deleting a redeemed coupon would
+    // silently erase the link on historical orders with no error. Refuse instead, and
+    // read the count inside the transaction so it cannot shift under us.
+    const [refs] = await connection.query("SELECT COUNT(*) AS n FROM orders WHERE coupon_id = ?", [id]);
+    const ordersUsed = Number(refs[0].n);
+    if (ordersUsed > 0) {
+      await connection.rollback();
+      return res.status(409).json({
+        error: `This coupon has been used on ${ordersUsed} order${ordersUsed === 1 ? "" : "s"} and cannot be deleted. Deactivate it instead.`,
+        code: "COUPON_IN_USE",
+        ordersUsed,
+      });
+    }
+    const [result] = await connection.query("DELETE FROM coupons WHERE id = ?", [id]);
+    if (!result.affectedRows) { await connection.rollback(); return res.status(404).json({ error: "Coupon not found." }); }
+    await connection.commit();
+    res.json({ success: true });
+  } catch (err) {
+    await connection.rollback().catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: "Could not delete the coupon." });
+  } finally {
+    connection.release();
+  }
+});
+
+// ---------- Admin: maintenance mode (Milestone 6 Phase 2) ----------
+// Under /api/admin/ on purpose: the maintenance guard bypasses that prefix, so
+// these stay reachable while maintenance is on — that is what makes turning it
+// back off possible. requireAdmin still applies, and it re-reads the role from
+// the database on every request, so the bypass grants no extra privilege.
+// Separate on/off endpoints rather than a toggle: an operator retrying a request
+// after a timeout must not flip the site back to the state they were leaving.
+
+app.get("/api/admin/system/maintenance", requireAdmin, async (req, res) => {
+  try {
+    res.json(await maintenanceSettings.readMaintenanceDetail());
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not read the maintenance setting." });
+  }
+});
+
+app.post("/api/admin/system/maintenance/on", requireAdmin, async (req, res) => {
+  try {
+    await maintenanceSettings.setMaintenanceMode(true, req.user.id);
+    console.warn(`Maintenance mode TURNED ON by admin id ${req.user.id}.`);
+    res.json({ maintenance: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not enable maintenance mode." });
+  }
+});
+
+app.post("/api/admin/system/maintenance/off", requireAdmin, async (req, res) => {
+  try {
+    await maintenanceSettings.setMaintenanceMode(false, req.user.id);
+    console.warn(`Maintenance mode TURNED OFF by admin id ${req.user.id}.`);
+    res.json({ maintenance: false });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not disable maintenance mode." });
+  }
+});
+
+/* Saves mode, progress and message together. The dedicated on/off endpoints
+   above are kept for the quick switch and for existing consumers; this is the
+   full-configuration write used by the admin Maintenance page.
+
+   Validation is strict and server-side: the browser's number input is a
+   convenience, never the authority. Booleans must be real booleans (a string
+   "true" or a 1 is rejected), progress must be a whole number 0-100, and the
+   message must be text within MESSAGE_MAX.
+
+   The message is stored and served as PLAIN TEXT. It is deliberately not
+   HTML-escaped or tag-stripped here, because altering an administrator's words
+   would be wrong — instead the public page renders it with textContent, so
+   markup can never execute. */
+function validateMaintenanceBody(body) {
+  const b = body || {};
+
+  if (typeof b.maintenance !== "boolean") {
+    return { field: "maintenance", error: "maintenance must be true or false." };
+  }
+
+  // A strict integer, nothing else. Strings are rejected outright, INCLUDING
+  // numeric ones like "60": the admin page converts the input value with
+  // Number() before sending, so accepting "60" would only widen the API's
+  // contract past the one its single client actually uses, and a looser rule
+  // here is a rule that has to be re-proved every time something new calls it.
+  // This one condition also covers null, undefined, "", true, false, NaN and
+  // Infinity — each fails either the typeof or the isInteger half.
+  const progress = b.progress;
+  if (typeof progress !== "number" || !Number.isInteger(progress)) {
+    return { field: "progress", error: "progress must be a whole number from 0 to 100." };
+  }
+  if (progress < 0 || progress > 100) {
+    return { field: "progress", error: "progress must be between 0 and 100." };
+  }
+
+  let message = b.message;
+  if (message === null || message === undefined) message = "";
+  if (typeof message !== "string") return { field: "message", error: "message must be text." };
+  message = message.replace(/\s+/g, " ").trim();
+  if (message.length > maintenanceSettings.MESSAGE_MAX) {
+    return { field: "message", error: `message must be ${maintenanceSettings.MESSAGE_MAX} characters or fewer.` };
+  }
+
+  return { values: { maintenance: b.maintenance, progress, message } };
+}
+
+app.post("/api/admin/maintenance", requireAdmin, async (req, res) => {
+  const v = validateMaintenanceBody(req.body);
+  if (v.error) return res.status(400).json({ error: v.error, field: v.field });
+  try {
+    const saved = await maintenanceSettings.saveMaintenanceConfig(v.values, req.user.id);
+    console.warn(`Maintenance configuration saved by admin id ${req.user.id}: mode=${saved.maintenance} progress=${saved.progress}.`);
+    res.json({ success: true, ...saved });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not save the maintenance configuration." });
   }
 });
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`NeoFragrances API running at http://localhost:${PORT}`);
+  const emailNotice = emailModeNotice();
+  if (emailNotice) console.warn(emailNotice);
 });

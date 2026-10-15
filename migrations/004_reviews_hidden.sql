@@ -1,0 +1,91 @@
+-- ============================================================
+-- 004  reviews.hidden — admin moderation flag (hide / unhide)
+-- ============================================================
+-- Backlog: #15 (admin portal, Milestone 6 — Phase 3 review moderation);
+--          decision recorded at PROJECT-BACKLOG.md "reviews: permanent delete
+--          with confirmation + rating/count recalculation (hide/unhide ->
+--          Milestone 6)".
+-- Status: applied LOCAL ONLY on 2026-10-04. NOT applied to production.
+--
+-- WHY
+--   Milestone 5 gave admins only permanent delete. Moderation needs a
+--   reversible option: take a review out of the storefront without destroying
+--   the customer's content, so a wrong call can be undone.
+--
+--   `reviews` has no visibility concept at all today — no status, no
+--   soft-delete, nothing usable as a proxy — so this cannot be done without a
+--   column.
+--
+-- EXISTING DATA
+--   NOT NULL DEFAULT 0 backfills every existing review to visible, which
+--   reproduces today's behaviour exactly: nothing is currently hidden, so
+--   "all visible" is the correct starting state. No NULLs are possible and no
+--   separate backfill statement is needed.
+--
+-- WHY NO INDEX
+--   The public lookup is already served by the existing `product_id` index,
+--   and `hidden` is a two-value filter applied to that narrowed set. An index
+--   on a low-cardinality column here would add write cost for no read benefit.
+--
+-- WHY NO hidden_at / hidden_by
+--   Deliberately out of scope. Who-did-what belongs to the admin audit log
+--   (Milestone 6 Phase 5); adding bespoke columns now would duplicate it and
+--   then have to be reconciled.
+--
+-- AGGREGATE IMPACT — the important part
+--   products.avg_rating and products.review_count are STORED, not computed per
+--   request, and GET /api/products returns them with SELECT *, so they reach
+--   every customer. A hidden review must therefore be excluded from those
+--   aggregates or it would keep shaping the public rating invisibly. The
+--   application does this in one shared helper
+--   (recalculateProductRating in server.js), which filters
+--   `WHERE product_id = ? AND hidden = 0` and is used by every path that can
+--   change a product's rating: customer review creation, admin delete, admin
+--   hide and admin unhide.
+--
+--   Applying this migration alone changes nothing visible: every row defaults
+--   to 0, so the aggregates are identical until an admin hides something.
+--
+-- PRE-CHECK (run before applying, on every database)
+--   -- the column must not already exist (expect 0)
+--   SELECT COUNT(*) AS hidden_col_exists
+--     FROM information_schema.COLUMNS
+--    WHERE TABLE_SCHEMA = DATABASE()
+--      AND TABLE_NAME   = 'reviews'
+--      AND COLUMN_NAME  = 'hidden';
+--
+--   -- record the row count for the VERIFY step
+--   SELECT COUNT(*) AS total_reviews FROM reviews;
+--
+-- APPLY
+ALTER TABLE reviews
+  ADD COLUMN hidden TINYINT(1) NOT NULL DEFAULT 0;
+
+-- VERIFY
+--   SHOW COLUMNS FROM reviews LIKE 'hidden';
+--   -- expect one row: Type = tinyint(1), Null = 'NO', Default = 0
+--
+--   SELECT COUNT(*) AS total_reviews, SUM(hidden = 0) AS visible FROM reviews;
+--   -- visible must equal total_reviews: nothing becomes hidden by applying this
+--
+-- ROLLBACK
+--   ALTER TABLE reviews DROP INDEX ...;  -- not applicable, no index is added
+--   ALTER TABLE reviews DROP COLUMN hidden;
+--   -- Safe: dropping the column returns every review to visible. Run the
+--   -- rating recalculation afterwards only if reviews were hidden while the
+--   -- column existed, since those products' stored aggregates would have been
+--   -- computed from the visible subset.
+--
+-- RELEASE CHECKLIST (production / TiDB Cloud — not done)
+--   1. No pre-check can fail on data: the column is new and the default is
+--      safe. Unlike migration 005 (the reviews unique index) there is no
+--      duplicate reconciliation to do first.
+--   2. Deliberately plain SQL — no "IF NOT EXISTS" — so it is portable across
+--      MariaDB 10.4 (local) and TiDB (production). Re-running it fails safely
+--      with "Duplicate column name 'hidden'".
+--   3. One column per ALTER statement: multi-column ALTER depends on TiDB's
+--      multi-schema-change support, which is version-gated, and the production
+--      TiDB version has not been confirmed.
+--   4. Deploy order is not sensitive. The column is inert until the admin UI
+--      and the PATCH route ship, and every row starts visible.
+-- ============================================================

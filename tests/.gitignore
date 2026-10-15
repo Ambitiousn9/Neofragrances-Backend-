@@ -1,0 +1,10 @@
+# Screenshot folders written by the browser suites into this directory.
+# admin-e2e.js -> m5-shots/, account-e2e.js -> m4-shots/, restore-app-verify.js -> restore-shots/,
+# offers-behaviour.js -> offers-shots/, account-controls-tests.js -> account-shots/
+# They contain test-fixture pages, not real customer data, but they are run artefacts.
+m5-shots/
+m4-shots/
+restore-shots/
+offers-shots/
+maintenance-shots/
+account-shots/

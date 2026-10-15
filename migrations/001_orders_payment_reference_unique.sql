@@ -1,0 +1,61 @@
+-- ============================================================
+-- 001  orders.payment_reference — UNIQUE index
+-- ============================================================
+-- Backlog: #2 (payments). Status: applied to the LOCAL database on
+--          2026-10-02; applied and verified in PRODUCTION — complete.
+--          See "Release checklist" below.
+--
+-- WHY
+--   /api/payments/verify must create exactly one order per Paystack
+--   reference. Today that is enforced only in the application layer
+--   (server.js: GET_LOCK('nf_pay_<reference>') then
+--   SELECT id FROM orders WHERE payment_reference = ?). That guard is
+--   correct but advisory-lock based, so a dropped/expired lock, a
+--   second backend instance, or any future code path that inserts an
+--   order without taking the lock could double-credit one payment.
+--   A UNIQUE index makes "one order per reference" a database
+--   invariant instead of a convention.
+--
+--   Side benefit: the lookup above currently full-scans `orders`
+--   (payment_reference had no index at all). It becomes an index hit.
+--
+-- NULLs
+--   payment_reference stays NULLable. MariaDB, MySQL and TiDB all treat
+--   NULLs as distinct in a UNIQUE index, so any number of orders with a
+--   NULL reference remain legal. Only non-NULL duplicates are rejected.
+--
+-- PRE-CHECK (must return zero rows before applying, on every database)
+--   SELECT payment_reference, COUNT(*) AS n
+--     FROM orders
+--    WHERE payment_reference IS NOT NULL
+--    GROUP BY payment_reference
+--   HAVING COUNT(*) > 1;
+--
+-- APPLY
+ALTER TABLE orders
+  ADD UNIQUE KEY uq_orders_payment_reference (payment_reference);
+
+-- VERIFY
+--   SHOW INDEX FROM orders WHERE Key_name = 'uq_orders_payment_reference';
+--   -- expect one row, Non_unique = 0, Null = 'YES'
+--
+-- ROLLBACK
+--   ALTER TABLE orders DROP INDEX uq_orders_payment_reference;
+--
+-- RELEASE CHECKLIST (production / TiDB Cloud — done: applied and verified)
+--   1. The PRE-CHECK had to pass against production first, because
+--      production has real order history that predates this constraint.
+--      Done: the migration is applied and verified in production. Do NOT
+--      re-apply it there.
+--   2. Deliberately plain SQL — no "IF NOT EXISTS" — so it is portable
+--      across MariaDB 10.4 (local) and TiDB (production). Re-running it
+--      fails safely with "Duplicate key name"; it changes nothing.
+--   3. Duplicate handling is in place (added 2026-10-02, after this
+--      migration): server.js has isDuplicatePaymentReference(err) and
+--      the /api/payments/verify catch re-reads the order and returns the
+--      normal { alreadyProcessed: true } response when THIS index is the
+--      one that rejected the insert. Unrelated duplicate-key errors keep
+--      their previous rollback + HTTP 500 behaviour. The predicate
+--      matches the index name as a substring, so TiDB (which reports the
+--      key as "orders.uq_orders_payment_reference") matches too.
+-- ============================================================

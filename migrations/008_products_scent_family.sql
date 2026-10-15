@@ -1,0 +1,74 @@
+-- ============================================================
+-- 008  products.scent_family — owner-assigned primary scent family
+-- ============================================================
+-- Backlog: Shop by Scent Family — Stage A (local migration + admin API).
+-- Status: applied LOCAL ONLY on 2026-10-10. NOT applied to production —
+--         production application pending (see RELEASE CHECKLIST).
+--
+-- WHY
+--   The owner assigns each product to one of four primary scent families
+--   (floral, amber, fresh, woody) in the admin portal; the storefront filters
+--   and the homepage "Shop by Scent Family" section read that value. One
+--   nullable column on products is enough: one product has at most one
+--   primary family, GET /api/products already returns SELECT *, and the
+--   four keys are a fixed, owner-approved set (the same shape as
+--   products.category, which is a VARCHAR validated by the server).
+--
+--   NULL means "unassigned". Nothing is backfilled: every existing product
+--   stays unassigned until the owner classifies it. No other column, row,
+--   id, price, stock, image or deletion status is touched.
+--
+-- ALLOWED VALUES
+--   NULL, 'floral', 'amber', 'fresh', 'woody' — lower case only. The server
+--   (SCENT_FAMILIES in server.js) is the source of truth and validates every
+--   write; the CHECK below is a second guard on MariaDB. "Oriental" is not a
+--   value: the customer-facing label of 'amber' is Amber.
+--
+-- PRE-CHECK (expect 0 before applying)
+--   SELECT COUNT(*) AS column_exists
+--     FROM information_schema.COLUMNS
+--    WHERE TABLE_SCHEMA = DATABASE()
+--      AND TABLE_NAME   = 'products'
+--      AND COLUMN_NAME  = 'scent_family';
+--
+-- APPLY
+ALTER TABLE products
+  ADD COLUMN scent_family VARCHAR(20) NULL DEFAULT NULL AFTER category,
+  ADD INDEX idx_products_scent_family (scent_family),
+  ADD CONSTRAINT chk_products_scent_family
+    CHECK (scent_family IS NULL OR scent_family IN ('floral', 'amber', 'fresh', 'woody'));
+
+-- VERIFY
+--   SHOW COLUMNS FROM products LIKE 'scent_family';
+--   -- expect: varchar(20), Null = YES, Default = NULL
+--
+--   SELECT COUNT(*) AS assigned FROM products WHERE scent_family IS NOT NULL;
+--   -- expect 0: nothing is backfilled
+--
+--   SELECT COUNT(*), SUM(deleted_at IS NULL), SUM(stock_qty) FROM products;
+--   -- unchanged: adding a nullable column writes no data
+--
+--   SELECT CONSTRAINT_NAME, CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS
+--    WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'chk_products_scent_family';
+--
+-- ROLLBACK
+--   ALTER TABLE products
+--     DROP CONSTRAINT chk_products_scent_family,
+--     DROP INDEX idx_products_scent_family,
+--     DROP COLUMN scent_family;
+--   -- Discards any families assigned since; export them first if they matter:
+--   --   SELECT id, scent_family FROM products WHERE scent_family IS NOT NULL;
+--
+-- RELEASE CHECKLIST (production / TiDB Cloud — not done)
+--   1. Apply BEFORE the server release that adds the scent-family endpoints;
+--      the endpoints UPDATE this column and fail without it. GET endpoints
+--      are unaffected either way (SELECT * simply gains a column).
+--   2. TiDB parses CHECK constraints but only enforces them when
+--      tidb_enable_check_constraint is ON (v7.2+). Without it the CHECK is
+--      silently ignored — harmless, because the server validates every write.
+--      Decide before release whether to keep the CHECK clause for TiDB.
+--   3. Deliberately plain SQL — no "IF NOT EXISTS". Re-running fails safely
+--      with "Duplicate column name"; it changes nothing.
+--   4. Migrations 002–007 are still local only; agree the production order
+--      for the whole backlog before applying this one.
+-- ============================================================

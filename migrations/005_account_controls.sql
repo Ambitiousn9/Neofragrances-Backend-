@@ -1,0 +1,142 @@
+-- ============================================================
+-- 005  users.disabled_at / disabled_reason / token_version
+--      Account Controls (Milestone 6 — Phase 4): disable and
+--      re-enable a customer account, reversibly.
+-- ============================================================
+-- Backlog: #15 (admin portal, Milestone 6 — Phase 4 account controls).
+-- Status: applied LOCAL ONLY on 2026-10-07. NOT applied to production.
+--
+-- WHY DISABLE AND NOT DELETE — the important part
+--   `users` is the target of seven foreign keys, and the two that matter are
+--   ON DELETE CASCADE:
+--
+--     users -> orders (CASCADE) -> order_items (CASCADE)
+--
+--   So `DELETE FROM users WHERE id = ?` silently destroys every order and
+--   every order line that customer ever placed: revenue history, the data
+--   behind /api/admin/reports and /api/admin/summary, and the purchase
+--   evidence behind `reviews.is_verified_purchase`. addresses, reviews and
+--   wishlist cascade too. There is no safe "remove this customer" operation
+--   on this schema, and Account Controls deliberately does not add one.
+--
+--   Disabling is the reversible alternative: the row stays, every child row
+--   stays, and the only thing that changes is whether the account can
+--   authenticate.
+--
+-- WHY THREE COLUMNS
+--   disabled_at      WHEN (and whether) the account was disabled. NULL = active.
+--   disabled_reason  WHY, for administrators only. Never leaves the admin API.
+--   token_version    Makes the disable stick to tokens already in the wild.
+--
+--   The third one is the non-obvious one. requireAuth verifies a JWT and
+--   performs no database lookup, and tokens live for 7 days, so disabling an
+--   account cannot by itself stop a token that was already issued. Account
+--   status is now read on every authenticated request (cached), which closes
+--   that window — but re-enabling would otherwise bring every old token back
+--   to life. token_version is incremented ON DISABLE and never touched on
+--   re-enable, so every token minted before the disable is permanently dead
+--   and a re-enabled customer must log in again.
+--
+--   An integer comparison was chosen over comparing the JWT `iat` against
+--   disabled_at. `iat` is floored integer SECONDS from the Node process clock,
+--   while disabled_at would be second-precision from the DATABASE clock (every
+--   timestamp column in this schema is DATETIME_PRECISION = 0). On Render +
+--   TiDB those are different hosts, so the comparison would depend on clock
+--   agreement and would silently fail for a token issued in the same second as
+--   the disable. An integer has no precision, no skew and no timezone.
+--
+-- EXISTING DATA
+--   disabled_at and disabled_reason are NULL for every existing row, which is
+--   exactly "active" — today's behaviour, unchanged.
+--
+--   token_version NOT NULL DEFAULT 0 backfills every user to 0. This is what
+--   makes the change backward compatible: JWTs issued before this migration
+--   carry no `v` claim at all, and the server reads an absent claim as 0, so
+--   they continue to match. Nobody is logged out by applying this.
+--
+-- WHY NO INDEX
+--   disabled_at is read by primary key (the account-status lookup is
+--   `WHERE id = ?`), never scanned. The admin customer list already does a
+--   full scan of a small table with a GROUP BY. An index here would add write
+--   cost for no read benefit, the same reasoning as migration 004.
+--
+-- WHY NO SESSION / REVOCATION TABLE
+--   Considered and rejected. A session table would give per-device revocation
+--   and "sign out everywhere", which nothing in the roadmap asks for, and it
+--   would be the first table in this project needing scheduled pruning.
+--   token_version gives the one property actually required — invalidate
+--   everything issued before a point in time — for one integer column.
+--
+-- WHY NO disabled_by
+--   Deliberately out of scope, exactly as migration 004 left out hidden_by.
+--   Who-did-what belongs to the admin audit log (Milestone 6 — Phase 5).
+--
+-- PRE-CHECK (run before applying, on every database)
+--   -- none of the three columns may already exist (expect 0)
+--   SELECT COUNT(*) AS account_control_cols
+--     FROM information_schema.COLUMNS
+--    WHERE TABLE_SCHEMA = DATABASE()
+--      AND TABLE_NAME   = 'users'
+--      AND COLUMN_NAME IN ('disabled_at', 'disabled_reason', 'token_version');
+--
+--   -- record the row count for the VERIFY step
+--   SELECT COUNT(*) AS total_users FROM users;
+--
+-- APPLY
+--   One column per ALTER: multi-column ALTER depends on TiDB's
+--   multi-schema-change support, which is version-gated, and the production
+--   TiDB version has not been confirmed. Same rule as migrations 002 and 004.
+ALTER TABLE users
+  ADD COLUMN disabled_at TIMESTAMP NULL DEFAULT NULL;
+
+ALTER TABLE users
+  ADD COLUMN disabled_reason VARCHAR(200) NULL DEFAULT NULL;
+
+ALTER TABLE users
+  ADD COLUMN token_version INT UNSIGNED NOT NULL DEFAULT 0;
+
+-- VERIFY
+--   SHOW COLUMNS FROM users LIKE 'disabled_at';
+--   -- expect: Type = timestamp, Null = 'YES', Default = NULL
+--
+--   SHOW COLUMNS FROM users LIKE 'disabled_reason';
+--   -- expect: Type = varchar(200), Null = 'YES', Default = NULL
+--
+--   SHOW COLUMNS FROM users LIKE 'token_version';
+--   -- expect: Type = int(10) unsigned, Null = 'NO', Default = 0
+--
+--   SELECT COUNT(*) AS total_users,
+--          SUM(disabled_at IS NULL) AS active,
+--          SUM(token_version = 0)   AS version_zero
+--     FROM users;
+--   -- active and version_zero must both equal total_users: applying this
+--   -- disables nobody and invalidates no existing session.
+--
+-- ROLLBACK
+--   ALTER TABLE users DROP COLUMN token_version;
+--   ALTER TABLE users DROP COLUMN disabled_reason;
+--   ALTER TABLE users DROP COLUMN disabled_at;
+--   -- Safe in itself: dropping the columns returns every account to active.
+--   -- Roll the APPLICATION back first, though. The server reads these columns
+--   -- on every authenticated request; dropping them under a running server
+--   -- makes that lookup fail, and the account-status cache then falls back to
+--   -- its last known state or, with nothing cached, to fail-open. The site
+--   -- stays up either way, but it logs an error per cache miss until the old
+--   -- code is deployed.
+--
+-- RELEASE CHECKLIST (production / TiDB Cloud — not done)
+--   1. No pre-check can fail on data: all three columns are new and every
+--      default is safe. There is no backfill and no reconciliation to do.
+--   2. Deliberately plain SQL — no "IF NOT EXISTS" — so it is portable across
+--      MariaDB 10.4 (local) and TiDB (production). Re-running any statement
+--      fails safely with "Duplicate column name".
+--   3. One column per ALTER (see APPLY).
+--   4. TIMESTAMP NULL DEFAULT NULL is written explicitly so the column cannot
+--      pick up the implicit NOT NULL / auto-initialise behaviour that the
+--      first TIMESTAMP column in a table gets when
+--      explicit_defaults_for_timestamp is OFF. It mirrors products.deleted_at,
+--      which is the existing precedent for a nullable state timestamp here.
+--   5. Deploy the migration BEFORE the application. The columns are inert
+--      until the new code reads them, but the new code cannot run without
+--      them: requireAuth's status lookup selects all three.
+-- ============================================================

@@ -1,0 +1,70 @@
+-- ============================================================
+-- 007  offer_products (offer_id, product_id) — UNIQUE index
+-- ============================================================
+-- Backlog: #15 (admin portal, Milestone 6 — Phase 6 multi-product offers).
+-- Status: applied LOCAL ONLY on 2026-10-08. NOT applied to production —
+--         production application pending.
+--
+-- WHY
+--   Phase 6 lets one offer cover up to 50 products, one offer_products row
+--   per product, each with its own original_price and sale_price. Nothing in
+--   the schema stops the same product being attached to the same offer twice.
+--   If that ever happened, the price for (offer, product) would be ambiguous:
+--   pricing.js priceCart() picks the first matching row, the public offers
+--   endpoint would return the product twice, and the admin list would count
+--   it twice. The server validates against duplicates, but a UNIQUE index
+--   makes "one price per product per offer" a database invariant instead of
+--   a convention, exactly as migration 001 did for payment references.
+--
+--   A product may still belong to SEVERAL different offers (overlapping
+--   offers are allowed; the customer pays the lowest live sale price). This
+--   index only forbids the same pair twice.
+--
+-- EXISTING INDEXES — kept on purpose
+--   idx_offer_products_offer (offer_id) becomes a left-prefix of this index
+--   and is technically redundant, but it is left in place: dropping it is a
+--   separate change, fk_offer_products_offer may be using it, and keeping it
+--   makes this migration purely additive with a one-statement rollback.
+--   idx_offer_products_product (product_id) is still needed for lookups by
+--   product and by fk_offer_products_product.
+--
+-- PRE-CHECK (must return zero rows before applying, on every database)
+--   SELECT offer_id, product_id, COUNT(*) AS n
+--     FROM offer_products
+--    GROUP BY offer_id, product_id
+--   HAVING COUNT(*) > 1;
+--
+--   -- the index must not already exist (expect 0)
+--   SELECT COUNT(*) AS uq_exists
+--     FROM information_schema.STATISTICS
+--    WHERE TABLE_SCHEMA = DATABASE()
+--      AND TABLE_NAME   = 'offer_products'
+--      AND INDEX_NAME   = 'uq_offer_products_offer_product';
+--
+-- APPLY
+ALTER TABLE offer_products
+  ADD UNIQUE KEY uq_offer_products_offer_product (offer_id, product_id);
+
+-- VERIFY
+--   SHOW INDEX FROM offer_products WHERE Key_name = 'uq_offer_products_offer_product';
+--   -- expect two rows (offer_id seq 1, product_id seq 2), Non_unique = 0
+--
+--   SELECT COUNT(*) FROM offer_products;
+--   -- unchanged: adding the index writes no data
+--
+-- ROLLBACK
+--   ALTER TABLE offer_products DROP INDEX uq_offer_products_offer_product;
+--   -- Safe: removes the guard only; no data changes.
+--
+-- RELEASE CHECKLIST (production / TiDB Cloud — not done)
+--   1. The PRE-CHECK must pass against production first. Production has
+--      offer history that predates this constraint and has not been
+--      inspected for duplicates.
+--   2. Apply BEFORE the Phase 6 server release, so the database already
+--      rejects duplicate pairs when multi-product create/update ships.
+--   3. Deliberately plain SQL — no "IF NOT EXISTS" — so it is portable
+--      across MariaDB 10.4 (local) and TiDB (production). Re-running it
+--      fails safely with "Duplicate key name"; it changes nothing.
+--   4. No CHECK constraint and no foreign-key change, so it adds no new
+--      TiDB version assumption.
+-- ============================================================
