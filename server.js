@@ -11,6 +11,7 @@ const pool = require("./db");
 const { CURRENCY, PricingError, toCedis, priceCart, signSnapshot, readSignedSnapshot, quoteForClient } = require("./pricing");
 const maintenanceSettings = require("./settings");
 const accounts = require("./accounts");
+const { createRateLimiter, createLoginThrottle } = require("./rate-limit");
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 
 if (!GOOGLE_CLIENT_ID) {
@@ -241,8 +242,36 @@ app.get("/api/products", async (req, res) => {
   }
 });
 
+// ---------- Login + registration rate limits ----------
+// In-memory and per process (rate-limit.js). Keyed on req.ip, which Express derives
+// using the "trust proxy" setting above: with 1 trusted hop it is the last
+// X-Forwarded-For entry added by the proxy in front of us. That is only correct if
+// Render really adds exactly one hop — verify on staging before production. Locally,
+// with no proxy in front, a client can choose its own X-Forwarded-For value.
+//
+// Login counts FAILED attempts only (HTTP 401: unknown email or wrong password):
+//   Tier A: 5 per 15 minutes per IP + normalised email, cleared by a successful login;
+//   Tier B: 30 per 15 minutes per IP across all emails, never cleared by a success.
+// Registration counts every attempt that reaches it: 10 per hour per IP, checked
+// before validation, the MX lookup, the database and the verification email.
+// maxKeys bounds memory: once full, the least recently used key is dropped.
+const RATE_LIMIT_MAX_KEYS = 50000;
+const RATE_LIMITED_MESSAGE = "Too many attempts. Please wait a few minutes and try again.";
+const loginThrottle = createLoginThrottle({ windowMs: 15 * 60 * 1000, perAccountMax: 5, perIpMax: 30, maxKeys: RATE_LIMIT_MAX_KEYS });
+const registerLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 10, maxKeys: RATE_LIMIT_MAX_KEYS });
+
+function sendRateLimited(res, retryAfterSeconds) {
+  res.set("Retry-After", String(Math.max(1, retryAfterSeconds)));
+  return res.status(429).json({ error: RATE_LIMITED_MESSAGE, code: "RATE_LIMITED" });
+}
+
 // ---------- Register ----------
 app.post("/api/register", async (req, res) => {
+  // Before anything else: every attempt that gets past this line counts, valid or not.
+  const registerKey = String(req.ip || "unknown").slice(0, 64);
+  if (registerLimiter.isLimited(registerKey)) return sendRateLimited(res, registerLimiter.retryAfterSeconds(registerKey));
+  registerLimiter.record(registerKey);
+
   const { fullName, email, phone, password } = req.body;
 
   if (!fullName || !email || !password) {
@@ -292,15 +321,22 @@ app.post("/api/login", async (req, res) => {
     return res.status(400).json({ error: "Email and password are required." });
   }
 
+  // Both tiers are checked before the account lookup and the password check, so a
+  // blocked request costs nothing and reveals nothing about the account.
+  const throttle = loginThrottle.check(req.ip, email);
+  if (throttle.limited) return sendRateLimited(res, throttle.retryAfter);
+
   try {
     const [rows] = await pool.query("SELECT * FROM users WHERE email = ?", [email]);
     if (rows.length === 0) {
+      loginThrottle.recordFailure(req.ip, email);
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
     const user = rows[0];
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) {
+      loginThrottle.recordFailure(req.ip, email);
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
@@ -320,6 +356,8 @@ app.post("/api/login", async (req, res) => {
 
     const token = jwt.sign({ id: user.id, role: user.role, v: Number(user.token_version) || 0 }, process.env.JWT_SECRET, { expiresIn: "7d" });
 
+    // Success clears Tier A for this IP + email only; Tier B is left to expire.
+    loginThrottle.recordSuccess(req.ip, email);
     res.json({
       token,
       user: { id: user.id, full_name: user.full_name, email: user.email, role: user.role },
@@ -1574,27 +1612,7 @@ app.post("/api/addresses", requireAuth, async (req, res) => {
 // Every query here is scoped to req.user.id from the verified JWT — never to an
 // id supplied by the browser — so customers can only see and change their own data.
 
-// Small in-memory rate limiter (same approach as the password-reset limiter).
-function createRateLimiter({ windowMs, max }) {
-  const hits = new Map();
-  setInterval(() => {
-    const now = Date.now();
-    for (const [key, list] of hits) {
-      const fresh = list.filter(t => now - t < windowMs);
-      if (fresh.length) hits.set(key, fresh); else hits.delete(key);
-    }
-  }, windowMs).unref();
-  const recent = key => (hits.get(key) || []).filter(t => Date.now() - t < windowMs);
-  return {
-    // True if the key has already used up its allowance (records nothing).
-    isLimited(key) { return recent(key).length >= max; },
-    // Records one attempt for the key.
-    record(key) { const list = recent(key); list.push(Date.now()); hits.set(key, list); },
-    // Records an attempt and returns true when the key is over the limit.
-    limited(key) { this.record(key); return recent(key).length > max; },
-  };
-}
-
+// createRateLimiter (small in-memory limiter) lives in rate-limit.js.
 const passwordChangeLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 5 });
 const trackOrderLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10 });
 
