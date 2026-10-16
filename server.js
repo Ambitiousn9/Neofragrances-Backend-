@@ -2161,6 +2161,65 @@ app.post("/api/reset-password", async (req, res) => {
 const PAYSTACK_API_BASE = process.env.PAYSTACK_API_BASE || "https://api.paystack.co";
 const PAYMENT_REFERENCE_PATTERN = /^NF-[A-Za-z0-9-]{8,80}$/;
 
+// Outbound Paystack calls are bounded so a slow or hung Paystack can never hold a
+// request open indefinitely (the runtime default would wait minutes). Paystack
+// normally answers in well under a second.
+//   initialize: 15 s — the customer is waiting on the checkout button; no money has
+//               moved yet, so a timeout is safe to report as "try again".
+//   verify:     10 s — used by the callback page and by the webhook. Keeping it short
+//               leaves the webhook well inside the time a sender will wait for an
+//               answer; a timeout is treated as TEMPORARY (retry), never as failure.
+const PAYSTACK_INIT_TIMEOUT_MS = 15000;
+const PAYSTACK_VERIFY_TIMEOUT_MS = 10000;
+
+/* Classifies Paystack's answer to GET /transaction/verify/:reference.
+   Returns one of:
+     { kind: "success", tx }  Paystack confirms data.status === "success". The caller
+                              still runs every integrity check before settling.
+     { kind: "pending", status } a recognised non-final state; the payment may still
+                              complete (e.g. Mobile Money awaiting approval).
+     { kind: "failed",  status } a recognised definitive unsuccessful state.
+     { kind: "temporary", reason } the outcome could not be established: timeout,
+                              network error, non-2xx HTTP (incl. 429/5xx), unreadable
+                              JSON, a false/missing response-level flag, no transaction
+                              object, or a status value we do not recognise.
+   Only the documented transaction status decides pending/failed; an HTTP error or a
+   malformed body is never read as "the customer did not pay".
+
+   "abandoned" is treated as FAILED: Paystack uses it for a checkout the customer did
+   not complete. The customer-facing failed message therefore still tells anyone whose
+   money did leave their account to contact us with the reference before paying again.
+   Unknown status strings are TEMPORARY, the conservative choice. Logs carry the
+   reference and a short reason only — never headers, keys or response bodies. */
+const PAYSTACK_PENDING_STATUSES = new Set(["pending", "ongoing", "processing", "queued"]);
+const PAYSTACK_FAILED_STATUSES = new Set(["failed", "abandoned", "reversed"]);
+
+async function verifyWithPaystack(reference) {
+  let res, text;
+  try {
+    res = await fetch(`${PAYSTACK_API_BASE}/transaction/verify/${encodeURIComponent(reference)}`, {
+      headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
+      signal: AbortSignal.timeout(PAYSTACK_VERIFY_TIMEOUT_MS),
+    });
+    text = await res.text();
+  } catch (err) {
+    const reason = err && (err.name === "TimeoutError" || err.name === "AbortError") ? "timeout" : "network_error";
+    return { kind: "temporary", reason };
+  }
+  if (!res.ok) return { kind: "temporary", reason: `http_${res.status}` };
+  let data;
+  try { data = JSON.parse(text); } catch (e) { return { kind: "temporary", reason: "invalid_json" }; }
+  const tx = data && typeof data === "object" ? data.data : null;
+  if (data.status !== true || !tx || typeof tx !== "object" || typeof tx.status !== "string") {
+    return { kind: "temporary", reason: "unusable_response" };
+  }
+  const status = tx.status.toLowerCase();
+  if (status === "success") return { kind: "success", tx };
+  if (PAYSTACK_PENDING_STATUSES.has(status)) return { kind: "pending", status };
+  if (PAYSTACK_FAILED_STATUSES.has(status)) return { kind: "failed", status };
+  return { kind: "temporary", reason: "unrecognised_status" };
+}
+
 function sendPricingError(res, err) {
   if (!(err instanceof PricingError)) return false;
   res.status(err.status).json({ error: err.message, code: err.code, ...err.details });
@@ -2218,19 +2277,29 @@ app.post("/api/payments/initialize", requireAuth, async (req, res) => {
     };
     const { payload, sig } = signSnapshot(snapshot);
 
-    const paystackRes = await fetch(`${PAYSTACK_API_BASE}/transaction/initialize`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        email: userRows[0].email,
-        amount: pricing.total,              // integer pesewas, calculated by the server
-        currency: pricing.currency,
-        reference,
-        callback_url: `${process.env.FRONTEND_URL}/payment-callback.html`,
-        metadata: { nf_order: payload, nf_sig: sig },
-      }),
-    });
-    const paystackData = await paystackRes.json().catch(() => ({}));
+    let paystackRes, paystackData;
+    try {
+      paystackRes = await fetch(`${PAYSTACK_API_BASE}/transaction/initialize`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: userRows[0].email,
+          amount: pricing.total,              // integer pesewas, calculated by the server
+          currency: pricing.currency,
+          reference,
+          callback_url: `${process.env.FRONTEND_URL}/payment-callback.html`,
+          metadata: { nf_order: payload, nf_sig: sig },
+        }),
+        signal: AbortSignal.timeout(PAYSTACK_INIT_TIMEOUT_MS),
+      });
+      paystackData = await paystackRes.json().catch(() => ({}));
+    } catch (err) {
+      // Timeout or network error. No customer has been sent to Paystack, so nothing
+      // was charged: a plain "try again" is accurate.
+      const reason = err && (err.name === "TimeoutError" || err.name === "AbortError") ? "timeout" : "network_error";
+      console.error("Paystack initialize failed:", reason);
+      return res.status(502).json({ error: "We couldn't start the payment. Please try again.", code: "PAYSTACK_INIT_FAILED" });
+    }
     if (!paystackRes.ok || !paystackData.status || !paystackData.data?.authorization_url) {
       console.error("Paystack initialize failed:", paystackRes.status, paystackData.message);
       return res.status(502).json({ error: "We couldn't start the payment. Please try again.", code: "PAYSTACK_INIT_FAILED" });
@@ -2276,14 +2345,18 @@ async function settlePayment(reference, { requireUserId = null } = {}) {
     if (!process.env.PAYSTACK_SECRET_KEY) return { outcome: "unavailable" };
 
     // 1. Ask Paystack directly (server-to-server) what was actually charged.
-    const verifyRes = await fetch(`${PAYSTACK_API_BASE}/transaction/verify/${encodeURIComponent(reference)}`, {
-      headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
-    });
-    const verifyData = await verifyRes.json().catch(() => ({}));
-    const tx = verifyData && verifyData.data;
-    if (!verifyData.status || !tx || tx.status !== "success") {
-      return reject(400, "PAYMENT_NOT_SUCCESSFUL", "Payment was not successful.");
+    //    Only a recognised definitive state counts as "not successful"; anything we
+    //    cannot read reliably is TEMPORARY and nothing is settled (see verifyWithPaystack).
+    const verified = await verifyWithPaystack(reference);
+    if (verified.kind === "temporary") {
+      console.error("Paystack verification unavailable:", reference, verified.reason);
+      return { outcome: "temporary", reason: verified.reason };
     }
+    if (verified.kind === "pending") return { outcome: "pending", status: verified.status };
+    if (verified.kind === "failed") {
+      return reject(400, "PAYMENT_NOT_SUCCESSFUL", "Payment was not successful.", { paystackStatus: verified.status });
+    }
+    const tx = verified.tx;
     if (tx.reference !== reference) {
       return reject(400, "REFERENCE_MISMATCH", "Payment reference mismatch.");
     }
@@ -2471,13 +2544,29 @@ app.get("/api/payments/verify/:reference", requireAuthAllowDisabled, async (req,
         error: "Your payment was received, but an item sold out before we could reserve it. Please contact us with your payment reference and we'll resolve it.",
         code: result.code, reference,
       });
+    case "pending":
+      // 202: accepted, outcome not final. No order exists yet and none is claimed.
+      return res.status(202).json({
+        error: "Your payment is still being confirmed. Please don't pay again yet.",
+        code: "PAYMENT_PENDING", reference,
+      });
+    case "temporary":
+      return res.status(503).json({
+        error: "We couldn't confirm your payment right now. Please don't pay again — try checking again in a moment.",
+        code: "PAYMENT_VERIFY_UNAVAILABLE", reference,
+      });
     case "busy":
       return res.status(503).json({ error: "Your payment is being confirmed. Please refresh in a moment.", code: "VERIFY_BUSY" });
     case "unavailable":
       return res.status(503).json({ error: "Payments are not available right now.", code: "PAYMENTS_NOT_CONFIGURED" });
     default:
+      // Paystack confirmed the payment but the order could not be written (a database
+      // error). Not a payment failure, and retrying may succeed: settlement is idempotent.
       console.error(result.err);
-      return res.status(500).json({ error: "We couldn't confirm your payment. If you were charged, please contact us with your payment reference.", reference });
+      return res.status(500).json({
+        error: "Your payment was confirmed, but we couldn't finish creating your order yet. Please don't pay again — try again in a moment, or contact us with your payment reference.",
+        code: "SETTLEMENT_ERROR", reference,
+      });
   }
 });
 
@@ -2488,7 +2577,19 @@ app.get("/api/payments/verify/:reference", requireAuthAllowDisabled, async (req,
    transaction with Paystack and builds the order from the signed snapshot.
 
    The status codes drive Paystack's retry behaviour, so they are deliberate: 2xx for
-   "handled, or permanently unactionable", 5xx only for "try me again". */
+   "handled, or permanently unactionable", 5xx only for "try me again".
+     200  order created; already processed (duplicate delivery); an unrelated event
+          type; an unusable reference; a verified payment that can never settle as-is
+          (out of stock, amount/currency/snapshot mismatch, coupon used up) — retrying
+          those cannot help, they are logged for manual handling; Paystack reporting a
+          definitive failed/abandoned/reversed state for a charge.success event.
+     503  verification TEMPORARILY unavailable (timeout, network, HTTP 429/5xx,
+          unreadable response); Paystack still reporting a pending state; the
+          per-reference lock busy; payments not configured.
+     500  the database failed while creating the order after Paystack confirmed it.
+   Assumption (not verified against Paystack, deliberately conservative): any non-2xx
+   makes Paystack redeliver the event later, and redelivery is safe because
+   settlement is idempotent per reference. */
 app.post(PAYMENT_WEBHOOK_PATH, async (req, res) => {
   const limiterKey = `webhook:${req.ip}`;
   if (paymentWebhookLimiter.isLimited(limiterKey)) return res.status(429).end();
@@ -2527,13 +2628,18 @@ app.post(PAYMENT_WEBHOOK_PATH, async (req, res) => {
     case "rejected":
       console.error("WEBHOOK: charge.success could not be settled:", reference, result.code);
       return res.status(200).json({ received: true, rejected: result.code });
+    case "pending":
+      console.error("WEBHOOK: charge.success but Paystack still reports", result.status, "for", reference, "— asking for redelivery");
+      return res.status(503).json({ received: false, code: "PAYMENT_PENDING" });
+    case "temporary":
+      return res.status(503).json({ received: false, code: "PAYMENT_VERIFY_UNAVAILABLE" });
     case "busy":
       return res.status(503).json({ received: false, code: "VERIFY_BUSY" });
     case "unavailable":
       return res.status(503).json({ received: false, code: "PAYMENTS_NOT_CONFIGURED" });
     default:
       console.error("WEBHOOK: settlement failed for", reference, result.err);
-      return res.status(500).json({ received: false });
+      return res.status(500).json({ received: false, code: "SETTLEMENT_ERROR" });
   }
 });
 
