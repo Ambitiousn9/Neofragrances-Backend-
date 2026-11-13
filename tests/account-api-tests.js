@@ -28,7 +28,7 @@ const call = async (method, url, token, body) => {
     const mk = async (name, provider) => { const id = (await q("INSERT INTO users (full_name, email, phone, password_hash, role, email_verified_at, auth_provider) VALUES (?, ?, '0200000000', ?, 'customer', NOW(), ?)", [name, `nf-acct-${name.toLowerCase()}-${stamp}@gmail.com`, hash, provider])).insertId; ids.push(id); return id; };
     const A = await mk("Alice", "local"), B = await mk("Bob", "local"), G = await mk("Gina", "google");
     const tok = id => jwt.sign({ id, role: "customer" }, SECRET);
-    const tA = tok(A), tB = tok(B), tG = tok(G);
+    let tA = tok(A); const tB = tok(B), tG = tok(G);
     const emailA = `nf-acct-alice-${stamp}@gmail.com`;
     const addr = async (uid, label, def) => (await q("INSERT INTO addresses (user_id, label, full_name, address_line1, city, country, is_default) VALUES (?, ?, 'Test', '1 Road', 'Accra', 'Ghana', ?)", [uid, label, def])).insertId;
     const a1 = await addr(A, "Home", 1), a2 = await addr(A, "Work", 0), a3 = await addr(A, "Spare", 0), b1 = await addr(B, "BobHome", 1);
@@ -67,7 +67,7 @@ const call = async (method, url, token, body) => {
     r = await call("POST", "/api/me/password", tA, { currentPassword: "WrongOne1", newPassword: "NewPass789" }); check("password: wrong current rejected", r.status === 400 && r.data.field === "currentPassword");
     r = await call("POST", "/api/me/password", tA, { currentPassword: "Secret123", newPassword: "123" }); check("password: too short rejected", r.status === 400 && r.data.field === "newPassword");
     r = await call("POST", "/api/me/password", tA, { currentPassword: "Secret123", newPassword: "Secret123" }); check("password: same as current rejected", r.status === 400);
-    r = await call("POST", "/api/me/password", tA, { currentPassword: "Secret123", newPassword: "NewPass789" }); check("password: change succeeds", r.status === 200 && r.data.success);
+    r = await call("POST", "/api/me/password", tA, { currentPassword: "Secret123", newPassword: "NewPass789" }); check("password: change succeeds", r.status === 200 && r.data.success); const tAold = tA; tA = r.data.token; check("password: change revokes earlier sessions (old token 401), returned token works", (await call("GET", "/api/me", tAold)).status === 401 && (await call("GET", "/api/me", tA)).status === 200);
     const loginOld = await call("POST", "/api/login", null, { email: emailA, password: "Secret123" });
     const loginNew = await call("POST", "/api/login", null, { email: emailA, password: "NewPass789" });
     check("password: old rejected, new accepted at login", loginOld.status === 401 && loginNew.status === 200, `${loginOld.status}/${loginNew.status}`);

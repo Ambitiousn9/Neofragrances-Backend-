@@ -1775,30 +1775,58 @@ app.post("/api/me/password", requireAuth, async (req, res) => {
     return res.status(400).json({ error: `Your new password must be at least ${MIN_PASSWORD_LENGTH} characters.`, field: "newPassword" });
   }
   if (newPassword.length > 200) return res.status(400).json({ error: "That password is too long.", field: "newPassword" });
+  // A password change ends every existing session of this account (G-1): the new hash and
+  // a token_version increment are written in one locked transaction, the same mechanism as
+  // POST /api/admin/logout, so a token stolen before the change stops working. The caller
+  // gets a fresh token carrying the new version, so the session that made the change stays
+  // signed in. Outstanding password-reset links are withdrawn in the same transaction.
+  let connection;
   try {
-    const [rows] = await pool.query("SELECT password_hash, auth_provider FROM users WHERE id = ?", [req.user.id]);
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    const [rows] = await connection.query(
+      "SELECT id, role, password_hash, auth_provider, disabled_at, token_version FROM users WHERE id = ? FOR UPDATE", [req.user.id]);
     const user = rows[0];
-    if (!user) return res.status(401).json({ error: "Your session has expired. Please log in again." });
+    const refuse = async (status, body) => { await connection.rollback(); return res.status(status).json(body); };
+    if (!user) return refuse(401, { error: "Your session has expired. Please log in again." });
     if (user.auth_provider === "google") {
-      return res.status(400).json({ error: "Your account uses Google sign-in. Set a password using the emailed link instead.", code: "PASSWORD_NOT_SET" });
+      return refuse(400, { error: "Your account uses Google sign-in. Set a password using the emailed link instead.", code: "PASSWORD_NOT_SET" });
     }
     if (typeof currentPassword !== "string" || !currentPassword) {
-      return res.status(400).json({ error: "Please enter your current password.", field: "currentPassword" });
+      return refuse(400, { error: "Please enter your current password.", field: "currentPassword" });
     }
     const matches = await bcrypt.compare(currentPassword, user.password_hash);
     if (!matches) {
       passwordChangeLimiter.record(`user:${req.user.id}`);
-      return res.status(400).json({ error: "Your current password is incorrect.", field: "currentPassword" });
+      return refuse(400, { error: "Your current password is incorrect.", field: "currentPassword" });
     }
     if (await bcrypt.compare(newPassword, user.password_hash)) {
-      return res.status(400).json({ error: "Choose a password you haven't used for this account.", field: "newPassword" });
+      return refuse(400, { error: "Choose a password you haven't used for this account.", field: "newPassword" });
     }
     const hash = await bcrypt.hash(newPassword, 10);
-    await pool.query("UPDATE users SET password_hash = ? WHERE id = ?", [hash, req.user.id]);
-    res.json({ success: true });
+    const [result] = await connection.query(
+      "UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE id = ?", [hash, user.id]);
+    if (result.affectedRows !== 1) throw new Error("password change did not update exactly one user");
+    await connection.query("DELETE FROM password_resets WHERE user_id = ? AND used_at IS NULL", [user.id]);
+    const [after] = await connection.query("SELECT disabled_at, token_version FROM users WHERE id = ?", [user.id]);
+    await connection.commit();
+
+    // Committed. Seed this process's account cache with the new version (other instances
+    // catch up within accounts.TTL_MS); a cache failure must not turn a committed change
+    // into an error.
+    const tokenVersion = Number(after[0].token_version) || 0;
+    try {
+      accounts.invalidateAccountStatus(user.id, { disabled: after[0].disabled_at !== null && after[0].disabled_at !== undefined, tokenVersion });
+    } catch (cacheErr) {
+      console.error("password change: account cache update failed:", cacheErr.message);
+    }
+    res.json({ success: true, token: signSessionToken({ id: user.id, role: user.role, token_version: tokenVersion }) });
   } catch (err) {
+    if (connection) await connection.rollback().catch(() => {});
     console.error(err);
     res.status(500).json({ error: "Could not change your password." });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -2183,39 +2211,75 @@ app.get("/api/reset-password/verify", async (req, res) => {
 
 // ---------- Reset Password ----------
 app.post("/api/reset-password", async (req, res) => {
-  const { token, password } = req.body;
-  if (!token || !password) {
+  const { token, password } = req.body || {};
+  if (typeof token !== "string" || typeof password !== "string" || !token || !password) {
     return res.status(400).json({ error: "Token and new password are required." });
   }
   if (password.length < 6) {
     return res.status(400).json({ error: "Password must be at least 6 characters." });
   }
+  if (password.length > 200) {
+    return res.status(400).json({ error: "That password is too long." });
+  }
 
   const INVALID = { error: "This password reset link is invalid or has expired. Please request a new one." };
+  const tokenHash = hashResetToken(token);
 
+  let connection;
   try {
-    const tokenHash = hashResetToken(token);
-    const [rows] = await pool.query(
-      "SELECT * FROM password_resets WHERE token_hash = ? AND used_at IS NULL AND expires_at > NOW() LIMIT 1",
+    // Cheap check first, so an unknown or expired link never costs a bcrypt hash. It is
+    // repeated under a row lock below; this one only short-circuits.
+    const [pre] = await pool.query(
+      "SELECT id FROM password_resets WHERE token_hash = ? AND used_at IS NULL AND expires_at > NOW() LIMIT 1",
       [tokenHash]
     );
-    if (rows.length === 0) {
+    if (pre.length === 0) {
       return res.status(400).json(INVALID);
     }
-
-    const resetRecord = rows[0];
     const passwordHash = await bcrypt.hash(password, 10);
 
+    // One transaction (G-1): the link is consumed exactly once (conditional UPDATE), a
+    // disabled account is refused with the same generic answer as forgot-password, and the
+    // new password plus a token_version increment end every existing session of the account.
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    const [rows] = await connection.query(
+      "SELECT id, user_id FROM password_resets WHERE token_hash = ? AND used_at IS NULL AND expires_at > NOW() LIMIT 1 FOR UPDATE",
+      [tokenHash]
+    );
+    const invalid = async () => { await connection.rollback(); return res.status(400).json(INVALID); };
+    if (rows.length === 0) return invalid();
+    const resetRecord = rows[0];
+    const [users] = await connection.query("SELECT id, disabled_at FROM users WHERE id = ? FOR UPDATE", [resetRecord.user_id]);
+    if (users.length === 0 || users[0].disabled_at) return invalid();
+    const [used] = await connection.query(
+      "UPDATE password_resets SET used_at = NOW() WHERE id = ? AND used_at IS NULL", [resetRecord.id]);
+    if (used.affectedRows !== 1) return invalid();
+
     // After a reset the customer knows their password, so password sign-in (and changes) apply.
-    await pool.query("UPDATE users SET password_hash = ?, auth_provider = 'local' WHERE id = ?", [passwordHash, resetRecord.user_id]);
+    const [updated] = await connection.query(
+      "UPDATE users SET password_hash = ?, auth_provider = 'local', token_version = token_version + 1 WHERE id = ?",
+      [passwordHash, resetRecord.user_id]);
+    if (updated.affectedRows !== 1) throw new Error("password reset did not update exactly one user");
+    await connection.query("DELETE FROM password_resets WHERE user_id = ? AND used_at IS NULL", [resetRecord.user_id]);
+    const [after] = await connection.query("SELECT disabled_at, token_version FROM users WHERE id = ?", [resetRecord.user_id]);
+    await connection.commit();
 
-    await pool.query("UPDATE password_resets SET used_at = NOW() WHERE id = ?", [resetRecord.id]);
-    await pool.query("DELETE FROM password_resets WHERE user_id = ? AND used_at IS NULL", [resetRecord.user_id]);
-
+    try {
+      accounts.invalidateAccountStatus(resetRecord.user_id, {
+        disabled: after[0].disabled_at !== null && after[0].disabled_at !== undefined,
+        tokenVersion: Number(after[0].token_version) || 0,
+      });
+    } catch (cacheErr) {
+      console.error("password reset: account cache update failed:", cacheErr.message);
+    }
     res.json({ success: true });
   } catch (err) {
+    if (connection) await connection.rollback().catch(() => {});
     console.error(err);
     res.status(500).json({ error: "Could not reset your password." });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
