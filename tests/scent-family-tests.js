@@ -22,9 +22,12 @@
 //
 // Ports: API 5075 (5055-5074 and 5099 are taken by the other suites).
 const path = require("path"), crypto = require("crypto");
-const { spawn } = require("child_process");
 // This file lives in <repo>/tests, so default to the repo root above it.
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
+// T04: runs ONLY under the isolated-database guard (nf_test_* on 127.0.0.1:3308); see
+// tests/README.md, "Isolated test database". Checked before dotenv and db.js load.
+const iso = require("./support/isolated-suite");
+iso.requireIsolation("scent-family-tests.js");
 require(path.join(process.cwd(), "node_modules/dotenv")).config({ quiet: true });
 const jwt = require(path.join(process.cwd(), "node_modules/jsonwebtoken"));
 const pool = require(path.join(process.cwd(), "db"));
@@ -63,6 +66,7 @@ async function snapshot() {
 const realProductsHash = async () => crypto.createHash("sha256").update(JSON.stringify(await q("SELECT * FROM products ORDER BY id"))).digest("hex").slice(0, 16);
 
 (async () => {
+  await iso.verifyParentIdentity(pool, "scent-family-tests.js");
   const stamp = Date.now();
   const fx = { users: [], products: [] };
   const before = await snapshot();
@@ -89,12 +93,8 @@ const realProductsHash = async () => crypto.createHash("sha256").update(JSON.str
     const tForged = jwt.sign({ id: CUST, role: "admin" }, SECRET);          // customer claiming admin
     const tBadSig = jwt.sign({ id: ADMIN, role: "admin" }, "not-the-secret");
 
-    // SERVER_LOG=<file> keeps the spawned server's output for diagnosis (default: discarded).
-    const logFd = process.env.SERVER_LOG ? require("fs").openSync(process.env.SERVER_LOG, "w") : "ignore";
-    server = spawn(process.execPath, ["server.js"], { env: { ...process.env, PORT: "5075", JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true", SENDGRID_API_KEY: "" }, stdio: ["ignore", logFd, logFd] });
-    let up = false;
-    for (let i = 0; i < 100 && !up; i++) { try { await fetch(API + "/"); up = true; } catch (e) { await sleep(200); } }
-    if (!up) throw new Error("the test server on port 5075 did not start (set SERVER_LOG=<file> to see why)");
+    // Guarded child; on a startup failure the error carries its last output lines.
+    server = await iso.startGuardedServer({ suite: "scent-family-tests.js", port: 5075, env: { JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true", SENDGRID_API_KEY: "" } });
 
     const famOf = async id => (await q("SELECT scent_family FROM products WHERE id = ?", [id]))[0]?.scent_family ?? null;
     const famsOf = async ids => (await q("SELECT id, scent_family FROM products WHERE id IN (?) ORDER BY id", [ids])).map(r => r.scent_family);
@@ -282,7 +282,7 @@ const realProductsHash = async () => crypto.createHash("sha256").update(JSON.str
       console.log(`cleanup: fixture products=${left.p} fixture users=${left.u}`);
       check("Z3. no fixture rows left behind", Number(left.p) === 0 && Number(left.u) === 0, js(left));
     } catch (e) { console.error("CLEANUP ERROR", e.message); results.push(false); }
-    if (server) server.kill();
+    iso.stopServer(server);
     await pool.end();
     const failed = results.filter(x => !x).length;
     console.log(`\n${results.length - failed}/${results.length} passed${failed ? ` — ${failed} FAILED` : ""}`);

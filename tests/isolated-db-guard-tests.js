@@ -151,9 +151,10 @@ const GOOD_CFG = { host: "127.0.0.1", port: "3308", database: "nf_test_selftest"
     const extRefused = await Promise.all(["https://api.paystack.co/x", "http://localhost:5000/", "http://[::1]:5000/", "https://example.com/"].map(u => fakeGlobal.fetch(u).then(() => false, isGuardErr)));
     const fakeDns = { promises: { Resolver: class { async resolveMx() { return [{ exchange: "mx" }]; } } } };
     const mstats = G.refuseMx(fakeDns);
-    // The MX refusal keeps code ENOTFOUND on purpose (the server treats it as "no mail
-    // server"), so it is identified by the guard's error name rather than its code.
-    const mxRefused = await new fakeDns.promises.Resolver().resolveMx("example.com").then(() => false, e => e.name === "IsolatedDbGuardError" && e.code === "ENOTFOUND");
+    // The MX refusal carries code ESERVFAIL (a temporary DNS failure, T04), so server.js takes
+    // its "lookup could not be completed: allow and warn" path; it is identified by the
+    // guard's error name.
+    const mxRefused = await new fakeDns.promises.Resolver().resolveMx("example.com").then(() => false, e => e.name === "IsolatedDbGuardError" && e.code === "ESERVFAIL");
     check("G16b fetch is limited to http://127.0.0.1:<port>/ and MX lookups are refused (fakes; scope: fetch + dns.resolveMx only)",
       fetched.length === 1 && extRefused.every(Boolean) && fstats.fetchRefused === 4 && mxRefused && mstats.mxRefused === 1);
 

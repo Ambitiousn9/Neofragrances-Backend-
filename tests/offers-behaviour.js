@@ -29,6 +29,10 @@ const path = require("path"), fs = require("fs"), os = require("os"), crypto = r
 const { spawn } = require("child_process");
 // This file lives in <repo>/tests, so default to the repo root above it.
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
+// T04: runs ONLY under the isolated-database guard (nf_test_* on 127.0.0.1:3308; see
+// tests/README.md, "Isolated test database"). Checked before dotenv and db.js load.
+const iso = require("./support/isolated-suite");
+iso.requireIsolation("offers-behaviour.js");
 require(path.join(process.cwd(), "node_modules/dotenv")).config({ quiet: true });
 const jwt = require(path.join(process.cwd(), "node_modules/jsonwebtoken"));
 const pool = require(path.join(process.cwd(), "db"));
@@ -58,6 +62,7 @@ const RESTORED_SQL = `SELECT id, active,
 const n = v => Number(v) || 0;
 
 (async () => {
+  await iso.verifyParentIdentity(pool, "offers-behaviour.js");
   const stamp = Date.now();
   const fx = { products: [], offers: [] };
   let server, edge, ws, adminId;
@@ -105,8 +110,7 @@ const n = v => Number(v) || 0;
     /* ---------- temporary admin + test server ---------- */
     adminId = (await q("INSERT INTO users (full_name, email, password_hash, role, email_verified_at, auth_provider) VALUES ('Offers Check Admin', ?, NULL, 'admin', NOW(), 'local')", [`nf-offers-admin-${stamp}@example.invalid`])).insertId;
     const tok = jwt.sign({ id: adminId, role: "admin" }, SECRET, { expiresIn: "1h" });
-    server = spawn(process.execPath, ["server.js"], { env: { ...process.env, PORT: 5066, JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", FRONTEND_URL: FRONT, NODE_ENV: "" }, stdio: "ignore" });
-    for (let i = 0; i < 60; i++) { try { await fetch(API + "/"); break; } catch (e) { await sleep(200); } }
+    server = await iso.startGuardedServer({ suite: "offers-behaviour.js", port: 5066, env: { JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", FRONTEND_URL: FRONT, NODE_ENV: "" } });
     const adm = async p => (await fetch(API + p, { headers: { Authorization: `Bearer ${tok}` } })).json();
     const activeOffers = async () => (await (await fetch(API + "/api/offers/active")).json());
     const statusOf = async id => ((await adm("/api/admin/offers")).find(o => o.id === id) || {}).status || null;
@@ -259,7 +263,7 @@ const n = v => Number(v) || 0;
 
     /* ---------- A42-A43 ---------- */
     check("A42. no uncaught JS exceptions in the browser", exceptions.length === 0, exceptions.join(" | "));
-    check("A43. the test server did not crash", server.exitCode === null, `exitCode=${server.exitCode}`);
+    check("A43. the test server did not crash", server.proc.exitCode === null, `exitCode=${server.proc.exitCode}`);
   } catch (err) {
     console.error("TEST HARNESS ERROR:", err);
     results.push(false);
@@ -285,7 +289,7 @@ const n = v => Number(v) || 0;
       check("A44. database back to the exact baseline after cleanup", JSON.stringify(before) === JSON.stringify(after), JSON.stringify(after));
     } catch (e) { console.error("CLEANUP ERROR:", e.message); results.push(false); }
     try { ws && ws.close(); } catch (e) {}
-    if (edge) edge.kill(); if (server) server.kill(); await pool.end();
+    if (edge) edge.kill(); iso.stopServer(server); await pool.end();
     const failed = results.filter(r => !r).length;
     console.log(`\n${results.length - failed}/${results.length} passed${failed ? ` — ${failed} FAILED` : ""}`);
     process.exit(failed ? 1 : 0);

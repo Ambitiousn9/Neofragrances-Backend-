@@ -102,21 +102,21 @@ Previously: **614/614** (2026-10-04), across eleven suites, before
 |---|---|---|---|---|
 | `payment-tests.js` | Cart quote, Paystack initialize, `/api/payments/verify` integrity (amounts, signed metadata, idempotency, stock, coupons, offers), and the `POST /api/payments/webhook` signature + idempotency cases | 5055 | — | 68/68 (2026-10-19; 0 failed, exit code 0 — one guarded run of the in-repo file against the isolated test database `nf_test_payment_20261019`, Paystack mocked on 127.0.0.1:5099; see "Isolated-database run of `payment-tests.js`" below. Earlier 68/68 figures were older-code runs) |
 | `e2e-checkout.js` | Cart → checkout → payment callback in headless Edge (functional only: the Google Fonts and Font Awesome stylesheets are blocked on purpose). Isolated test database only; see "Isolated harness for `e2e-checkout.js`" | 5055 (mock Paystack 5099) | 9334 | **Not run against the current harness.** 29/29 was recorded for the older version, which used the working database; it is not evidence for the current file |
-| `auth-e2e.js` | Register / verify / login / password reset (`DEV_EMAIL_LOG=true`, no Paystack, Google or SendGrid keys) | 5055 | 9336 | 28/28 |
-| `account-api-tests.js` | Milestone 4 account API + access control | 5056 | — | 49/49 |
-| `account-e2e.js` | Milestone 4 My Account pages in headless Edge | 5057 | 9337 | 61/61 |
+| `auth-e2e.js` | Register / verify / login / password reset (`DEV_EMAIL_LOG=true`, no Paystack, Google or SendGrid keys) | 5055 | 9336 | **28/28** (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 28/28 |
+| `account-api-tests.js` | Milestone 4 account API + access control | 5056 | — | **50/50** (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 49/49 |
+| `account-e2e.js` | Milestone 4 My Account pages in headless Edge | 5057 | 9337 | **61/61** (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 61/61 |
 | `admin-api-tests.js` | Milestone 5 admin API + Milestone 6 coupons and review moderation (products, orders, reviews, offers, stock, coupon CRUD, review hide/unhide) | 5058 | — | 108/108 (2026-10-17, ADMIN-5F; 0 failed, exit code 0 — one controlled run against the isolated test database `nf_test_admin_api_20261017`, not the working `neofragrances` database; see "Isolated-database run of `admin-api-tests.js`" below). 108/108 again on 2026-10-19 (Option 2B runtime verification, same database, exit code 0) |
-| `admin-e2e.js` | Milestone 5 admin pages + the Coupons page + review hide/unhide + the Phase 6 multi-product offer editor (section 8) in headless Edge | 5059 | 9339 | 98/98 |
-| `restore-app-verify.js` | Catalog-restoration **fidelity** only: counts, prices, UTF-8, NULLs, exact offer rows. No time-sensitive offer liveness — see `offers-behaviour.js` | 5060, 5070 | 9340 | 34/34 |
-| `offers-behaviour.js` | Offer **behaviour**: live / expired / scheduled / disabled, the expiry boundary, status precedence, storefront sale pricing. Own DB-clock-relative fixtures. A23 waits (up to 10 s) for the sale price to reach the catalogue card instead of reading it after a fixed 800 ms | 5066 | 9341 | 44/44 |
-| `platform-tests.js` | CORS allowlist + `GET /api/health` (three server instances) | 5063, 5064, 5065 | — | 19/19 |
-| `maintenance-tests.js` | Maintenance mode: the global guard, the bypass list, the admin toggle, the TTL cache, and fail-open on a settings read failure | 5067, 5068 | 9342 | 81/81 |
-| `account-controls-tests.js` | Account Controls: customer disable / enable, token-version invalidation, the account-status cache, local + Google login and password-reset behaviour, the payment-settlement exception, the admin control, and disabled-session handling in the storefront | 5071, 5072 | 9343 | 87/87 |
-| `order-status-history-tests.js` | Order Status History: the migration 006 schema and backfill, the admin status-transition rules (forward / cancel / backward-with-note / final), one history row per real change, atomicity with the restock, the customer and admin history views, and both order pages in headless Edge | 5073 | 9344 | 92/92 |
-| `offers-multi-product-tests.js` | Multi-product offers (Phase 6A-6D): migration 007's UNIQUE (offer_id, product_id), `items[]` create / update (1-50 products, atomic, per-item validation), the grouped admin listing, the lowest-live-price rule on every storefront surface and in the cart, the admin offer editor, and the "+N more in this offer" banner / spotlight. Never touches offer 1, offer 30002 or real products | 5074 | 9345 | 127/127 |
-| `scent-family-tests.js` | Scent family (Stage A, API only): migration 008's `products.scent_family` (nullable, CHECK, no backfill); `PATCH /api/admin/products/:id/scent-family` and the all-or-nothing bulk `PATCH /api/admin/products/scent-family` (1-100 products) — every family, explicit null, malformed values / ids / payloads, archived and missing products, auth, a forced mid-write failure rolled back, only `scent_family` changing (updated_at kept), PUT keeping the family. Never touches real products | 5075 | — | 77/77 (focused run, 2026-10-10) |
-| `scent-family-admin-e2e.js` | Scent families admin page (Stage B), in headless Edge: nav registration, the five tiles against real counts, search + family / unassigned / stock filters, 30-per-page pagination, single assign / reassign / unassign with Undo and the in-flight state (no duplicate request), an archived-elsewhere product, bulk assign through the confirmation (exact ids + family on the wire), cancel, the 100-product cap, a refused bulk request with no false success, expired session and non-admin, the existing product editor keeping the family, 390px / 1366px. Never touches real products | 5076 | 9346 | 47/47 (focused run, 2026-10-10) |
-| `scent-family-storefront-e2e.js` | Shop by Scent Family storefront (Stage C2), in headless Edge: each family filter returns only its products (case-normalised, URL kept, combined with stock, facet lists only the four families); invalid / legacy / empty / space-padded `?scent=` values show a "not found" state (never the full catalogue, never echoed, kept across a refresh) with a removable chip and family links; an empty family's own empty state; the unfiltered catalogue and search unchanged; the homepage section hidden until all four families have ≥ 5 active in-stock classified products (stock / archived / unclassified edges), exactly four photo cards once eligible, hidden on product-API failure or empty data; existing homepage sections intact; 1366 / 820 / 390 px, Tab focus ring, reduced motion. Never touches real products; image files checksummed. Since 2026-10-13, after the owner's classifications were written to the local database, an isolated mode hides non-fixture families in the browser and six further checks compare against the real catalogue | 5077 | 9347 | 62/62 (focused run, 2026-10-13, after that test fix; recorded in the 2026-10-13 test-fix records kept outside the repo, not a saved log here. Earlier: 56/56 on 2026-10-10. Older code: predates Stage B, ADMIN-3 and migration 009) |
+| `admin-e2e.js` | Milestone 5 admin pages + the Coupons page + review hide/unhide + the Phase 6 multi-product offer editor (section 8) in headless Edge | 5059 | 9339 | **98/98** (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 98/98 |
+| `restore-app-verify.js` | Catalog-restoration **fidelity** only: counts, prices, UTF-8, NULLs, exact offer rows. No time-sensitive offer liveness — see `offers-behaviour.js` | 5060, 5070 | 9340 | **34/34** (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 34/34 |
+| `offers-behaviour.js` | Offer **behaviour**: live / expired / scheduled / disabled, the expiry boundary, status precedence, storefront sale pricing. Own DB-clock-relative fixtures. A23 waits (up to 10 s) for the sale price to reach the catalogue card instead of reading it after a fixed 800 ms | 5066 | 9341 | **44/44** (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 44/44 |
+| `platform-tests.js` | CORS allowlist + `GET /api/health` (three server instances) | 5063, 5064, 5065 | — | **19/19** (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 19/19 |
+| `maintenance-tests.js` | Maintenance mode: the global guard, the bypass list, the admin toggle, the TTL cache, and fail-open on a settings read failure | 5067, 5068 | 9342 | **81/81** (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 81/81 |
+| `account-controls-tests.js` | Account Controls: customer disable / enable, token-version invalidation, the account-status cache, local + Google login and password-reset behaviour, the payment-settlement exception, the admin control, and disabled-session handling in the storefront | 5071, 5072 | 9343 | **87/87** (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 87/87 |
+| `order-status-history-tests.js` | Order Status History: the migration 006 schema and backfill, the admin status-transition rules (forward / cancel / backward-with-note / final), one history row per real change, atomicity with the restock, the customer and admin history views, and both order pages in headless Edge | 5073 | 9344 | **92/92** (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 92/92 |
+| `offers-multi-product-tests.js` | Multi-product offers (Phase 6A-6D): migration 007's UNIQUE (offer_id, product_id), `items[]` create / update (1-50 products, atomic, per-item validation), the grouped admin listing, the lowest-live-price rule on every storefront surface and in the cart, the admin offer editor, and the "+N more in this offer" banner / spotlight. Never touches offer 1, offer 30002 or real products | 5074 | 9345 | **127/127** (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 127/127 |
+| `scent-family-tests.js` | Scent family (Stage A, API only): migration 008's `products.scent_family` (nullable, CHECK, no backfill); `PATCH /api/admin/products/:id/scent-family` and the all-or-nothing bulk `PATCH /api/admin/products/scent-family` (1-100 products) — every family, explicit null, malformed values / ids / payloads, archived and missing products, auth, a forced mid-write failure rolled back, only `scent_family` changing (updated_at kept), PUT keeping the family. Never touches real products | 5075 | — | **77/77** (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 77/77 (focused run, 2026-10-10) |
+| `scent-family-admin-e2e.js` | Scent families admin page (Stage B), in headless Edge: nav registration, the five tiles against real counts, search + family / unassigned / stock filters, 30-per-page pagination, single assign / reassign / unassign with Undo and the in-flight state (no duplicate request), an archived-elsewhere product, bulk assign through the confirmation (exact ids + family on the wire), cancel, the 100-product cap, a refused bulk request with no false success, expired session and non-admin, the existing product editor keeping the family, 390px / 1366px. Never touches real products | 5076 | 9346 | **47/47** (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 47/47 (focused run, 2026-10-10) |
+| `scent-family-storefront-e2e.js` | Shop by Scent Family storefront (Stage C2), in headless Edge: each family filter returns only its products (case-normalised, URL kept, combined with stock, facet lists only the four families); invalid / legacy / empty / space-padded `?scent=` values show a "not found" state (never the full catalogue, never echoed, kept across a refresh) with a removable chip and family links; an empty family's own empty state; the unfiltered catalogue and search unchanged; the homepage section hidden until all four families have ≥ 5 active in-stock classified products (stock / archived / unclassified edges), exactly four photo cards once eligible, hidden on product-API failure or empty data; existing homepage sections intact; 1366 / 820 / 390 px, Tab focus ring, reduced motion. Never touches real products; image files checksummed. Since 2026-10-13, after the owner's classifications were written to the local database, an isolated mode hides non-fixture families in the browser and six further checks compare against the real catalogue | 5077 | 9347 | **61/62 (H2a expects 10 homepage sections; there are 11 since the 2026-10-27 footer redesign added `nf-footer-updates` — test expectation, not isolation)** (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 62/62 (focused run, 2026-10-13, after that test fix; recorded in the 2026-10-13 test-fix records kept outside the repo, not a saved log here. Earlier: 56/56 on 2026-10-10. Older code: predates Stage B, ADMIN-3 and migration 009) |
 | `auth-rate-limit-tests.js` | Login + registration rate limiting (Roadmap Task 3). Unit tests of `rate-limit.js` with an injected clock (threshold, Retry-After, expiry, `clear`, the key cap, the unchanged existing modes; the login throttle's Tier A / Tier B rules, including "a success clears Tier A but never Tier B"), then the real `server.js` **in this process**: Tier A (5 failures per IP + normalised email), Tier B (30 failures per IP), 429 JSON + `Retry-After`, blocked requests never reaching the account lookup, 400 and 403 not counted, registration 10 per IP per hour enforced before validation / MX lookup, and the track-order limiter unchanged. **Database-free:** `./db` is replaced in the require cache by an in-memory fake that refuses writes and unknown queries, `DB_PORT` is forced to 1, and outbound `fetch` and MX lookups are refused and recorded. Client IPs are simulated with `X-Forwarded-For`, which only works because nothing sits in front of a local server | 5079 | — | 51/51 (2026-10-15; re-run 51/51 on 2026-10-17 after migration 009 was applied locally, with `.env` blocked — in-memory database mock) |
 | `security-headers-tests.js` | API security headers (Roadmap Task 4, backend Phase A, `security-headers.js`): `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, the API CSP, COOP, CORP and `X-DNS-Prefetch-Control` on successful, private, CORS-preflight, malformed-JSON, 404, 429 and maintenance-503 responses; `X-Powered-By` absent; HSTS (`max-age=86400`) only when `X-Forwarded-Proto` says HTTPS; `Cache-Control: no-store` on the private route groups (`/api/me`, `/api/my-orders`, `/api/addresses`, `/api/wishlist`, `/api/admin/*`, `/api/payments/*`, case-insensitive, whole segments) and never on public catalogue routes; CORS and both rate limits unchanged. Express's default 404 / error handler replaces the CSP with its own `default-src 'none'` on the pages it writes; the suite asserts that real value. **Database-free**, same method as `auth-rate-limit-tests.js` (fake `./db`, `DB_PORT=1`, outbound `fetch` and MX lookups refused) | 5080 | — | 41/41 (2026-10-15; re-run 41/41 on 2026-10-17 after migration 009 was applied locally, with `.env` blocked — in-memory database mock) |
 | `payment-reliability-tests.js` | Payment reliability, Stage A (PI-01 / PI-02 / PI-07): Paystack verification classified as success / pending (`pending`, `ongoing`, `processing`, `queued`) / failed (`failed`, `abandoned`, `reversed`) / temporary (timeout, network reset, HTTP 404 / 429 / 5xx, invalid JSON, malformed or unrecognised answers); the callback's 201 / 200 / 202 `PAYMENT_PENDING` / 400 / 503 `PAYMENT_VERIFY_UNAVAILABLE` / 409 / 500 `SETTLEMENT_ERROR` answers; the webhook's 200 vs 503 / 500 retry policy (duplicate, pending, outage then recovery, DB failure, definitive failure, bad signature, unrelated event); every integrity check (reference, currency, amount, signed snapshot, other customer); rollback + lock release on a DB failure; the 10 s verify and 15 s initialize timeouts (really waited, in parallel); and `neofragrances-frontend/js/payment-result.js` in a vm sandbox (bag cleared only on a confirmed order, bounded pending re-checks, never invited to pay again while uncertain). **Database-free and network-isolated:** an in-memory fake `./db` with real transaction rollback, `DB_PORT=1`, a mock Paystack on 127.0.0.1:5082 with a fake key, every other outbound request refused. Takes about 20 s. Since Stage B it also simulates migration 009 **not** being applied: every `payment_issues` statement fails as "table doesn't exist", and every payment response must stay unchanged (B2) | 5081, 5082 | — | 66/66 (2026-10-17; 0 failed, 0 skipped — first run after the Stage B review corrections, and again 66/66 the same day after the lowercase-only payment-reference pattern change, with `.env` blocked; in-memory database mock + local mock Paystack, so not evidence of MariaDB/TiDB behaviour) |
@@ -425,19 +425,68 @@ behaviour. The header of the file shows the full launch line.
   violation or recorded CDP routing error. Cleanup runs in `finally` for all of these;
   it does not run on a hard kill, Ctrl+C or a guard exit (97).
 
+
+### Isolated runs of the fourteen converted suites (T04, 2026-11-13)
+
+Until 2026-11-13 fourteen database-backed suites read `.env` and wrote fixtures into whatever
+database it named — after the move to 3308 that would have been the working database. They
+now share `tests/support/isolated-suite.js`:
+
+- `requireIsolation(suite)` runs before dotenv and `db.js` and refuses unless the guard
+  preload is active through `NODE_OPTIONS`, `NF_TEST_MODE=isolated`, `DB_NAME = NF_TEST_DB_NAME`
+  (`nf_test_*`), `DB_HOST=127.0.0.1`, `DB_PORT=3308`;
+- `verifyParentIdentity(pool, suite)` runs the guard's identity gate before any fixture;
+- `startGuardedServer({ suite, port, env })` spawns `server.js` with the guard preload (a child
+  may not override `DB_*`, `NF_TEST_*` or `NODE_OPTIONS`), waits for its own listening line
+  (60 s), then one `/api/health` and the child's "identity verified" line;
+- `startNoDbServer(...)` is used for the unreachable-database instances (account-controls,
+  maintenance, platform): `tests/support/no-db-preload.js` blocks `.env`/dotenv, refuses any
+  MySQL target except 127.0.0.1:1, loopback-only listen, loopback-only fetch, no MX.
+
+Negative checks (no database needed, all 14): a plain `node tests/<suite>.js` refuses with
+`db.js`/`mysql2` never loaded and no connection attempted — also while the working 3308
+server was running; `DB_PORT=3306` → guard ABORT (exit 97); the guard loaded with `-r` but not
+in `NODE_OPTIONS` → refused.
+
+Launch (PowerShell, from `neofragrances-server`; 3308 started per
+`NeoFragrances-DB-ValidationRUNBOOK-LOCAL-DEV-3308.md`; browser suites also need the
+frontend on `127.0.0.1:5500`):
+
+```powershell
+$env:NF_TEST_MODE='isolated'; $env:NF_TEST_DB_NAME='nf_test_phase1_20261029'; $env:DB_NAME=$env:NF_TEST_DB_NAME
+$env:NF_TEST_DB_SERVER_HOSTNAME='AMBITIOUS'; $env:DB_HOST='127.0.0.1'; $env:DB_PORT='3308'; $env:DB_USER='root'; $env:DB_PASSWORD=''; $env:DB_SSL='false'
+$env:NODE_OPTIONS='--require="' + ((Resolve-Path testssupportisolated-db-guard-preload.js).Path -replace '\','/') + '"'
+node testsaccount-api-tests.js
+```
+
+Results 2026-11-13, one at a time on `nf_test_phase1_20261029`: 816/817 checks; see the
+"Last known green" column. The working `neofragrances` database was identical before and
+after (row counts, `CHECKSUM TABLE` of all 16 tables, auto-increments); the test database's
+counts and checksums were identical too (only auto-increments advanced), no triggers left.
+
+Changes the isolation exposed (all in tests or the guard, none in the app):
+- `restore-app-verify.js` read the public catalogue from the user's running backend on
+  `localhost:5000` (the working database); it now reads its own guarded instance.
+- `auth-e2e.js` relied on `JWT_SECRET` from `.env` (logins returned 500 under the guard); it
+  now injects its own. (No startup check for a missing `JWT_SECRET` exists — security G-6.)
+- The guard's MX refusal now carries `ESERVFAIL` (temporary failure) instead of `ENOTFOUND`, so
+  registration takes the documented "warn and allow" path; the lookup is still refused.
+- `account-e2e.js` / `account-api-tests.js` mint tokens with the current `token_version` /
+  adopt the token returned by a password change (G-1 ends earlier sessions).
+
 ## Running
 
-All twenty-three locate the repo themselves — no environment variable needed to find it.
-The exceptions to "nothing to set" are `admin-api-tests.js`, `payment-tests.js` and
-`e2e-checkout.js`, which refuse to start without the isolated-database configuration
-described under "Prerequisites" (`e2e-checkout.js` also needs `OUT_DIR` and
-`EDGE_PROFILE_PARENT`; each file's header shows the full launch line):
+All suites locate the repo themselves — no environment variable needed to find it.
+**Since T04 (2026-11-13) every database-backed suite — all seventeen — refuses to start
+without the isolated-database configuration** described under "Prerequisites", before it
+loads dotenv or `db.js`; a plain `node tests/<suite>.js` exits with "Refusing to run …"
+and touches no database. (`e2e-checkout.js` also needs `OUT_DIR` and
+`EDGE_PROFILE_PARENT`.) The database-free suites still run with nothing set:
 
 ```bash
 cd neofragrances-server
-node tests/auth-e2e.js
-node tests/admin-e2e.js
-# ...and so on, one at a time
+node tests/password-session-tests.js      # database-free
+# database-backed: see "Isolated test database" for the environment, then one at a time
 ```
 
 Twenty-one of them resolve the repo from their own location, identically:
@@ -454,12 +503,12 @@ contains it and refuses a `SERVER_DIR` that names any other directory.
 
 ### Prerequisites
 
-- **Database:** local MariaDB/MySQL, `DB_NAME=neofragrances`, reachable with the
-  credentials in `.env`, for the fourteen working-database suites. Every suite exits if
-  `DB_HOST` is not `localhost`/`127.0.0.1`. The six database-free suites and
-  `isolated-db-guard-tests.js` need no database. `admin-api-tests.js`,
-  `payment-tests.js` and `e2e-checkout.js` need an isolated test database (below) instead.
-- **Isolated test database (`admin-api-tests.js`, `payment-tests.js`, `e2e-checkout.js`).**
+- **Database:** no suite uses the working `neofragrances` database or `.env` any more (T04).
+  The six database-free suites and `isolated-db-guard-tests.js` need no database. All
+  seventeen database-backed suites need the isolated test database below. The browser
+  suites also need the frontend on `http://127.0.0.1:5500` and Microsoft Edge.
+- **Isolated test database (all seventeen database-backed suites; until 2026-11-13 only
+  `admin-api-tests.js`, `payment-tests.js`, `e2e-checkout.js`).**
   - A dedicated database whose name matches `^nf_test_[a-z0-9]+(_[a-z0-9]+)*$` on
     `127.0.0.1:3308`, provisioned from a backup of the working schema and brought up to
     the current migrations. The earlier runs used their own databases on the old server at
@@ -518,8 +567,8 @@ contains it and refuses a `SERVER_DIR` that names any other directory.
 | `SERVER_DIR` | all except `isolated-db-guard-tests.js` | Optional — overrides the self-located repo root. `e2e-checkout.js` accepts only unset or its own repo |
 | `OUT_DIR` | `e2e-checkout.js` | **Required**, no default: an absolute, existing directory outside both repositories and not the bare system temp folder; each run creates a new `e2e-checkout-<run id>` folder in it (kept) |
 | `EDGE_PROFILE_PARENT` | `e2e-checkout.js` | **Required**, same rules as `OUT_DIR`; each run creates a new `nf-edge-e2e-<run id>` Edge profile in it and deletes only that folder at the end |
-| `.env` values | the fourteen working-database suites (the database-free suites load it too unless dotenv is blocked) | Read from the repo's `.env` (`DB_*`); each suite injects its own throwaway `JWT_SECRET` |
-| `NF_TEST_MODE`, `NF_TEST_DB_NAME`, `NF_TEST_DB_SERVER_HOSTNAME`, `NODE_OPTIONS`, `DB_*` | `admin-api-tests.js`, `payment-tests.js`, `e2e-checkout.js` | Required; see "Isolated test database" above. `.env` is blocked by the guard |
+| `.env` values | none of the database-backed suites (the guard blocks `.env`); the database-free suites load it unless dotenv is blocked | Each suite injects its own throwaway `JWT_SECRET` |
+| `NF_TEST_MODE`, `NF_TEST_DB_NAME`, `NF_TEST_DB_SERVER_HOSTNAME`, `NODE_OPTIONS`, `DB_*` | all seventeen database-backed suites | Required; see "Isolated test database" above. `.env` is blocked by the guard |
 
 **Run them one at a time.** `payment-tests.js`, `e2e-checkout.js` and `auth-e2e.js`
 all use port **5055**, so starting one right after another fails with
@@ -590,9 +639,9 @@ all use port **5055**, so starting one right after another fails with
   SendGrid request is possible from any suite.
 - No secrets live in these files — each generates a random `JWT_SECRET` per run. Fixture
   passwords and fake keys (`sk_test_mock`) are test values only.
-- The seventeen database-backed suites do write to a local database — the working
-  `neofragrances` database for fourteen of them, an isolated test database for
-  `admin-api-tests.js`, `payment-tests.js` and `e2e-checkout.js` — (temporary users, addresses, orders, coupons,
+- The seventeen database-backed suites do write to a local database — since T04
+  (2026-11-13) only ever an isolated `nf_test_*` database on 127.0.0.1:3308, never the
+  working `neofragrances` database — (temporary users, addresses, orders, coupons,
   offers, products, reviews, wishlist rows) and delete it again in a `finally` block
   that also restores stock. The last line of a run reports what was left, e.g.
   `cleanup: users=1 orders=0 coupons=0 offers=2 addresses=0 | stock restored: true`

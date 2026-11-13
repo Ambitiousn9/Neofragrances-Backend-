@@ -232,7 +232,11 @@ function restrictFetch(globalObj, stats = { fetchAllowed: 0, fetchRefused: 0 }) 
 }
 
 function refuseMx(dnsModule, stats = { mxRefused: 0 }) {
-  const refusal = () => { stats.mxRefused++; return Object.assign(new GuardError("MX lookup refused by the isolation guard"), { code: "ENOTFOUND" }); };
+  // Code ESERVFAIL (a temporary DNS failure), not ENOTFOUND: server.js treats ENOTFOUND as
+  // "this domain has no mail server" and rejects the registration, but a lookup that could
+  // not be completed as "allow, log a warning" — the documented behaviour auth-e2e.js checks.
+  // The lookup itself is always refused either way.
+  const refusal = () => { stats.mxRefused++; return Object.assign(new GuardError("MX lookup refused by the isolation guard"), { code: "ESERVFAIL" }); };
   if (dnsModule.promises && dnsModule.promises.Resolver) {
     dnsModule.promises.Resolver.prototype.resolveMx = async () => { throw refusal(); };
     dnsModule.promises.resolveMx = async () => { throw refusal(); };

@@ -1,9 +1,12 @@
-// Milestone 4 API + access-control tests against the real server.js (:5056) and the LOCAL db.
+// Milestone 4 API + access-control tests against the real server.js (:5056) and an isolated
+// nf_test_* database on 127.0.0.1:3308 (T04: runs ONLY under the isolated-database guard; see
+// tests/README.md, "Isolated test database").
 const path = require("path"), crypto = require("crypto");
-const { spawn } = require("child_process");
 // This file lives in <repo>/tests, so default to the repo root above it: the suite then
 // runs as `node tests/<file>` with nothing set. An explicit SERVER_DIR still wins.
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
+const iso = require("./support/isolated-suite");
+iso.requireIsolation("account-api-tests.js"); // before dotenv and db.js
 require(path.join(process.cwd(), "node_modules/dotenv")).config({ quiet: true });
 const jwt = require(path.join(process.cwd(), "node_modules/jsonwebtoken"));
 const bcrypt = require(path.join(process.cwd(), "node_modules/bcrypt"));
@@ -21,6 +24,7 @@ const call = async (method, url, token, body) => {
 };
 
 (async () => {
+  await iso.verifyParentIdentity(pool, "account-api-tests.js");
   const stamp = Date.now(); const ids = [];
   let server;
   try {
@@ -37,8 +41,7 @@ const call = async (method, url, token, body) => {
     await q("INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase) VALUES (?, ?, 1, 480.00)", [order, p1.id]);
     const orderB = (await q("INSERT INTO orders (user_id, address_id, total, status) VALUES (?, ?, 100.00, 'Pending')", [B, b1])).insertId;
 
-    server = spawn(process.execPath, ["server.js"], { env: { ...process.env, PORT: 5056, JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true" }, stdio: "ignore" });
-    for (let i = 0; i < 60; i++) { try { await fetch(API + "/"); break; } catch (e) { await sleep(200); } }
+    server = await iso.startGuardedServer({ suite: "account-api-tests.js", port: 5056, env: { JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true" } });
 
     /* ---------- profile ---------- */
     let r = await call("GET", "/api/me");
@@ -75,7 +78,7 @@ const call = async (method, url, token, body) => {
     r = await call("POST", "/api/me/password", tG, { currentPassword: "x", newPassword: "Whatever99" }); check("Google account → set-password path (PASSWORD_NOT_SET)", r.status === 400 && r.data.code === "PASSWORD_NOT_SET");
     let rl = null; for (let i = 0; i < 6; i++) rl = await call("POST", "/api/me/password", tB, { currentPassword: "nope", newPassword: "Whatever99" });
     check("password change: 5 wrong current passwords → 6th attempt 429", rl.status === 429 && rl.data.code === "RATE_LIMITED");
-    r = await call("POST", "/api/me/password", tA, { currentPassword: "NewPass789", newPassword: "NewPass789x" }); check("rate limit is per account; new-password typos don't count (Alice unaffected)", r.status === 200, r.status);
+    r = await call("POST", "/api/me/password", tA, { currentPassword: "NewPass789", newPassword: "NewPass789x" }); check("rate limit is per account; new-password typos don't count (Alice unaffected)", r.status === 200, r.status); if (r.data && r.data.token) tA = r.data.token; // this change revoked Alice's previous token too
 
     /* ---------- addresses ---------- */
     r = await call("GET", "/api/addresses", tA);
@@ -139,7 +142,7 @@ const call = async (method, url, token, body) => {
       const c = (await q("SELECT (SELECT COUNT(*) FROM users) u,(SELECT COUNT(*) FROM addresses) a,(SELECT COUNT(*) FROM orders) o,(SELECT COUNT(*) FROM order_items) oi,(SELECT COUNT(*) FROM wishlist) w"))[0];
       console.log("\ncleanup:", JSON.stringify(c));
     } catch (e) { console.error("CLEANUP ERROR", e.message); }
-    if (server) server.kill(); await pool.end();
+    iso.stopServer(server); await pool.end();
     const failed = results.filter(r => !r).length;
     console.log(`\n${results.length - failed}/${results.length} passed${failed ? ` — ${failed} FAILED` : ""}`);
     process.exit(failed ? 1 : 0);

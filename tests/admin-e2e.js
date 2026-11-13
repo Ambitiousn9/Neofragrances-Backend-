@@ -6,6 +6,10 @@ const { spawn } = require("child_process");
 // This file lives in <repo>/tests, so default to the repo root above it: the suite then
 // runs as `node tests/<file>` with nothing set. An explicit SERVER_DIR still wins.
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
+// T04: runs ONLY under the isolated-database guard (nf_test_* on 127.0.0.1:3308; see
+// tests/README.md, "Isolated test database"). Checked before dotenv and db.js load.
+const iso = require("./support/isolated-suite");
+iso.requireIsolation("admin-e2e.js");
 require(path.join(process.cwd(), "node_modules/dotenv")).config({ quiet: true });
 const jwt = require(path.join(process.cwd(), "node_modules/jsonwebtoken"));
 const bcrypt = require(path.join(process.cwd(), "node_modules/bcrypt"));
@@ -20,6 +24,7 @@ const SHOTS = path.join(__dirname, "m5-shots"); fs.mkdirSync(SHOTS, { recursive:
 const BASE_SQL = "SELECT (SELECT COUNT(*) FROM users) u,(SELECT COUNT(*) FROM products) p,(SELECT COUNT(*) FROM orders) o,(SELECT COUNT(*) FROM order_items) oi,(SELECT COUNT(*) FROM addresses) a,(SELECT COUNT(*) FROM reviews) r,(SELECT COUNT(*) FROM offers) f,(SELECT COUNT(*) FROM offer_products) fp,(SELECT COUNT(*) FROM coupons) c,(SELECT SUM(stock_qty) FROM products) s";
 
 (async () => {
+  await iso.verifyParentIdentity(pool, "admin-e2e.js");
   const stamp = Date.now(); const userIds = [], productIds = [], orderIds = [];
   let server, edge, ws;
   const baseline = (await q(BASE_SQL))[0];
@@ -45,8 +50,7 @@ const BASE_SQL = "SELECT (SELECT COUNT(*) FROM users) u,(SELECT COUNT(*) FROM pr
     const tok = (id, role, exp = "1h") => jwt.sign({ id, role }, SECRET, { expiresIn: exp });
 
     /* ---------- server + browser ---------- */
-    server = spawn(process.execPath, ["server.js"], { env: { ...process.env, PORT: 5059, JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", FRONTEND_URL: FRONT, NODE_ENV: "" }, stdio: "ignore" });
-    for (let i = 0; i < 60; i++) { try { await fetch(API + "/"); break; } catch (e) { await sleep(200); } }
+    server = await iso.startGuardedServer({ suite: "admin-e2e.js", port: 5059, env: { JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", FRONTEND_URL: FRONT, NODE_ENV: "" } });
     const profile = path.join(os.tmpdir(), "nf-edge-m5"); fs.rmSync(profile, { recursive: true, force: true });
     edge = spawn("C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", ["--headless=new", "--remote-debugging-port=9339", `--user-data-dir=${profile}`, "--no-first-run", "about:blank"], { stdio: "ignore" });
     let wsUrl; for (let i = 0; i < 150 && !wsUrl; i++) { try { wsUrl = (await (await fetch("http://127.0.0.1:9339/json/list")).json()).find(t => t.type === "page")?.webSocketDebuggerUrl; } catch (e) {} if (!wsUrl) await sleep(200); }
@@ -488,7 +492,7 @@ const BASE_SQL = "SELECT (SELECT COUNT(*) FROM users) u,(SELECT COUNT(*) FROM pr
       check("database back to baseline", JSON.stringify(baseline) === JSON.stringify(now));
     } catch (e) { console.error("CLEANUP ERROR", e.message); results.push(false); }
     try { ws && ws.close(); } catch (e) {}
-    if (edge) edge.kill(); if (server) server.kill(); await pool.end();
+    if (edge) edge.kill(); iso.stopServer(server); await pool.end();
     const failed = results.filter(r => !r).length;
     console.log(`\n${results.length - failed}/${results.length} passed${failed ? ` — ${failed} FAILED` : ""}`);
     process.exit(failed ? 1 : 0);

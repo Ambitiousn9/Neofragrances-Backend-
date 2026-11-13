@@ -1,10 +1,17 @@
 // Auth E2E after E1/E2b/E4: real pages (:5500) + updated server.js (:5055, DEV_EMAIL_LOG=true,
 // no Paystack/Google/SendGrid keys) + headless Edge. Browser calls to :5000 are rerouted to :5055.
-const path = require("path"), fs = require("fs"), os = require("os");
+const path = require("path"), fs = require("fs"), os = require("os"), crypto = require("crypto");
 const { spawn } = require("child_process");
+// Throwaway signing secret for the child server. The suite used to rely on JWT_SECRET from
+// .env; the isolation guard blocks .env, so the child must be given its own (T04).
+const SECRET = crypto.randomBytes(32).toString("hex");
 // This file lives in <repo>/tests, so default to the repo root above it: the suite then
 // runs as `node tests/<file>` with nothing set. An explicit SERVER_DIR still wins.
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
+// T04: runs ONLY under the isolated-database guard (nf_test_* on 127.0.0.1:3308; see
+// tests/README.md, "Isolated test database"). Checked before dotenv and db.js load.
+const iso = require("./support/isolated-suite");
+iso.requireIsolation("auth-e2e.js");
 require(path.join(process.cwd(), "node_modules/dotenv")).config({ quiet: true });
 const pool = require(path.join(process.cwd(), "db"));
 if (!["localhost", "127.0.0.1"].includes(process.env.DB_HOST)) { console.error("not local"); process.exit(1); }
@@ -14,14 +21,14 @@ const q = async (s, p) => (await pool.query(s, p))[0];
 const results = []; const check = (n, c, x = "") => { results.push(!!c); console.log(`${c ? "PASS" : "FAIL"} ${n}${x ? "  [" + String(x).slice(0, 140) + "]" : ""}`); };
 
 (async () => {
+  await iso.verifyParentIdentity(pool, "auth-e2e.js");
   const stamp = Date.now();
   const email = `nf-auth-e2e-${stamp}@gmail.com`;
   const pass1 = "Secret123", pass2 = "NewSecret456";
   let server, edge, ws, serverLog = "";
   try {
-    server = spawn(process.execPath, ["server.js"], { env: { ...process.env, PORT: 5055, DEV_EMAIL_LOG: "true", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", SENDGRID_API_KEY: "", SENDGRID_FROM_EMAIL: "", FRONTEND_URL: FRONT, NODE_ENV: "" }, stdio: ["ignore", "pipe", "pipe"] });
-    server.stdout.on("data", d => serverLog += d); server.stderr.on("data", d => serverLog += d);
-    for (let i = 0; i < 60; i++) { try { await fetch("http://127.0.0.1:5055/"); break; } catch (e) { await sleep(200); } }
+    server = await iso.startGuardedServer({ suite: "auth-e2e.js", port: 5055, env: { JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", SENDGRID_API_KEY: "", SENDGRID_FROM_EMAIL: "", FRONTEND_URL: FRONT, NODE_ENV: "" } });
+    server.proc.stdout.on("data", d => serverLog += d); server.proc.stderr.on("data", d => serverLog += d); serverLog += server.log();
     check("server start notice shows DEV_EMAIL_LOG mode", /DEV_EMAIL_LOG is ON/.test(serverLog));
 
     const profile = path.join(os.tmpdir(), "nf-edge-auth2"); fs.rmSync(profile, { recursive: true, force: true });
@@ -161,7 +168,7 @@ const results = []; const check = (n, c, x = "") => { results.push(!!c); console
       console.log("\ncleanup:", JSON.stringify(c));
     } catch (e) { console.error("CLEANUP ERROR", e.message); }
     try { ws && ws.close(); } catch (e) {}
-    if (edge) edge.kill(); if (server) server.kill(); await pool.end();
+    if (edge) edge.kill(); iso.stopServer(server); await pool.end();
     const failed = results.filter(r => !r).length;
     console.log(`\n${results.length - failed}/${results.length} passed${failed ? ` — ${failed} FAILED` : ""}`);
     process.exit(failed ? 1 : 0);

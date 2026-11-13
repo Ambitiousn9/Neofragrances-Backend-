@@ -31,6 +31,10 @@
 const path = require("path"), fs = require("fs"), os = require("os"), crypto = require("crypto");
 const { spawn } = require("child_process");
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
+// T04: runs ONLY under the isolated-database guard (nf_test_* on 127.0.0.1:3308; see
+// tests/README.md, "Isolated test database"). Checked before dotenv and db.js load.
+const iso = require("./support/isolated-suite");
+iso.requireIsolation("scent-family-storefront-e2e.js");
 require(path.join(process.cwd(), "node_modules/dotenv")).config({ quiet: true });
 const pool = require(path.join(process.cwd(), "db"));
 // Safety gate — never weaken this.
@@ -60,6 +64,7 @@ const realHash = async exclude => crypto.createHash("sha256").update(JSON.string
 const imageSums = () => Object.fromEntries(fs.readdirSync(IMG_DIR).sort().map(f => [f, crypto.createHash("sha1").update(fs.readFileSync(path.join(IMG_DIR, f))).digest("hex")]));
 
 (async () => {
+  await iso.verifyParentIdentity(pool, "scent-family-storefront-e2e.js");
   const stamp = Date.now(), TOKEN = `SFS${stamp}`;
   const fx = [];
   const before = await snapshot();
@@ -81,10 +86,7 @@ const imageSums = () => Object.fromEntries(fs.readdirSync(IMG_DIR).sort().map(f 
     const UN = [await mk("Unclassified 0", null, 10), await mk("Unclassified 1", null, 10)];
 
     /* ---------- server + browser ---------- */
-    server = spawn(process.execPath, ["server.js"], { env: { ...process.env, PORT: "5077", JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true", SENDGRID_API_KEY: "", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", FRONTEND_URL: FRONT, NODE_ENV: "" }, stdio: "ignore" });
-    let up = false;
-    for (let i = 0; i < 100 && !up; i++) { try { await fetch(API + "/"); up = true; } catch (e) { await sleep(200); } }
-    if (!up) throw new Error("the test server on port 5077 did not start");
+    server = await iso.startGuardedServer({ suite: "scent-family-storefront-e2e.js", port: 5077, env: { JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true", SENDGRID_API_KEY: "", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", FRONTEND_URL: FRONT, NODE_ENV: "" } });
     const profile = path.join(os.tmpdir(), "nf-edge-sfstore"); fs.rmSync(profile, { recursive: true, force: true });
     edge = spawn("C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", ["--headless=new", "--remote-debugging-port=9347", `--user-data-dir=${profile}`, "--no-first-run", "about:blank"], { stdio: "ignore" });
     let wsUrl; for (let i = 0; i < 150 && !wsUrl; i++) { try { wsUrl = (await (await fetch("http://127.0.0.1:9347/json/list")).json()).find(t => t.type === "page")?.webSocketDebuggerUrl; } catch (e) {} if (!wsUrl) await sleep(200); }
@@ -338,7 +340,7 @@ const imageSums = () => Object.fromEntries(fs.readdirSync(IMG_DIR).sort().map(f 
     } catch (e) { console.error("CLEANUP ERROR", e.message); results.push(false); }
     try { ws && ws.close(); } catch (e) {}
     if (edge) edge.kill();
-    if (server) server.kill();
+    iso.stopServer(server);
     await pool.end();
     const failed = results.filter(x => !x).length;
     console.log(`\n${results.length - failed}/${results.length} passed${failed ? ` — ${failed} FAILED` : ""}`);

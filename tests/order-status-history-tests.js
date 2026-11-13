@@ -31,15 +31,16 @@
 const path = require("path"), fs = require("fs"), os = require("os"), crypto = require("crypto");
 const { spawn } = require("child_process");
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
+// T04: runs ONLY under the isolated-database guard (nf_test_* on 127.0.0.1:3308; see
+// tests/README.md, "Isolated test database"). Checked before dotenv and db.js load.
+const iso = require("./support/isolated-suite");
+iso.requireIsolation("order-status-history-tests.js");
 require(path.join(process.cwd(), "node_modules/dotenv")).config({ quiet: true });
 const jwt = require(path.join(process.cwd(), "node_modules/jsonwebtoken"));
 const bcrypt = require(path.join(process.cwd(), "node_modules/bcrypt"));
 const pool = require(path.join(process.cwd(), "db"));
-// Safety gate — never weaken this.
-if (!["localhost", "127.0.0.1"].includes(process.env.DB_HOST) || process.env.DB_NAME !== "neofragrances") {
-  console.error("Refusing to run: not the local database.");
-  process.exit(1);
-}
+// Safety gate: replaced by the isolated-database guard above (T04), which is stricter — it
+// refuses everything except an nf_test_* database on 127.0.0.1:3308 and checks its identity.
 
 const PORT = 5073, CDP_PORT = 9344;
 const API = `http://127.0.0.1:${PORT}`;
@@ -72,6 +73,7 @@ async function snapshot() {
 }
 
 (async () => {
+  await iso.verifyParentIdentity(pool, "order-status-history-tests.js");
   const stamp = Date.now();
   const TRIGGER = `nf_test_osh_fail_${stamp}`;
   const userIds = [], productIds = [], orderIds = [];
@@ -167,8 +169,8 @@ async function snapshot() {
     for (const id of [OG, OH]) await q("INSERT INTO order_status_history (order_id, from_status, to_status, changed_by, source, note) SELECT id, NULL, status, NULL, 'backfill', 'Status tracking began' FROM orders WHERE id = ?", [id]);
 
     /* ================= server ================= */
-    server = spawn(process.execPath, ["server.js"], { env: { ...process.env, PORT, JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", FRONTEND_URL: FRONT, NODE_ENV: "" }, stdio: "ignore" });
-    let up = false; for (let i = 0; i < 75 && !up; i++) { try { await fetch(API + "/api/health"); up = true; } catch (e) { await sleep(200); } }
+    server = await iso.startGuardedServer({ suite: "order-status-history-tests.js", port: PORT, env: { JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", FRONTEND_URL: FRONT, NODE_ENV: "" } });
+    const up = !server.gone();
     check("T0. test server started", up);
 
     /* ================= admin transitions: forward ================= */
@@ -404,7 +406,7 @@ async function snapshot() {
     check("U17. mobile (390px): no horizontal overflow on the customer order page", await ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`));
     await shot("03-customer-mobile");
     check("U18. no uncaught JS exceptions", exceptions.length === 0, exceptions.join(" | "));
-    check("U19. the test server is still running", server.exitCode === null);
+    check("U19. the test server is still running", server.proc.exitCode === null);
   } catch (err) {
     console.error("TEST HARNESS ERROR:", err);
     results.push(false);
@@ -426,7 +428,7 @@ async function snapshot() {
     } catch (e) { console.error("CLEANUP ERROR:", e.message); results.push(false); }
     try { ws && ws.close(); } catch (e) {}
     if (edge) edge.kill();
-    if (server) server.kill();
+    iso.stopServer(server);
     await pool.end();
     const failed = results.filter(r => !r).length;
     console.log(`\n${results.length - failed}/${results.length} passed${failed ? ` — ${failed} FAILED` : ""}`);

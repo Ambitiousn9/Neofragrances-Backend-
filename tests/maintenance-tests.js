@@ -34,15 +34,15 @@ const path = require("path"), fs = require("fs"), os = require("os"), crypto = r
 const { spawn } = require("child_process");
 // This file lives in <repo>/tests, so default to the repo root above it.
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
+// T04: runs ONLY under the isolated-database guard (nf_test_* on 127.0.0.1:3308; see
+// tests/README.md, "Isolated test database"). Checked before dotenv and db.js load.
+const iso = require("./support/isolated-suite");
+iso.requireIsolation("maintenance-tests.js");
 require(path.join(process.cwd(), "node_modules/dotenv")).config({ quiet: true });
 const jwt = require(path.join(process.cwd(), "node_modules/jsonwebtoken"));
 const bcrypt = require(path.join(process.cwd(), "node_modules/bcrypt"));
 const pool = require(path.join(process.cwd(), "db"));
 // Safety gate — never weaken this.
-if (!["localhost", "127.0.0.1"].includes(process.env.DB_HOST) || process.env.DB_NAME !== "neofragrances") {
-  console.error("Refusing to run: not the local database.");
-  process.exit(1);
-}
 
 const OK_PORT = 5067, DEAD_DB_PORT = 5068, CDP_PORT = 9342;
 const API = `http://127.0.0.1:${OK_PORT}`;
@@ -72,20 +72,16 @@ const call = async (base, method, url, token, body) => {
   return { status: res.status, data, text, ctype, retryAfter };
 };
 
-const startServer = (port, extraEnv = {}) => {
-  const proc = spawn(process.execPath, ["server.js"], {
-    env: Object.assign({}, process.env, {
-      PORT: String(port), JWT_SECRET: SECRET, SENDGRID_API_KEY: "",
-      PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", DEV_EMAIL_LOG: "true",
-      FRONTEND_URL: FRONT, NODE_ENV: "",
-    }, extraEnv),
-    stdio: "ignore",
-  });
-  return proc;
-};
+// A guarded child on the nf_test_* database, or (noDb) a child with no database at all
+// (127.0.0.1:1, no-database preload) for the fail-open cases.
+const startServer = (port, { noDb = false } = {}) => (noDb ? iso.startNoDbServer : iso.startGuardedServer)({
+  suite: "maintenance-tests.js", port,
+  env: { JWT_SECRET: SECRET, SENDGRID_API_KEY: "", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", DEV_EMAIL_LOG: "true", FRONTEND_URL: FRONT, NODE_ENV: "" },
+});
 const waitUp = async (base) => { for (let i = 0; i < 80; i++) { try { await fetch(base + "/"); return true; } catch (e) { await sleep(200); } } return false; };
 
 (async () => {
+  await iso.verifyParentIdentity(pool, "maintenance-tests.js");
   let okServer, deadServer, edge, ws, adminId, custId;
   // Record the prior state of every row this suite writes, so they can be put
   // back. Phase 2 wrote only maintenance_mode; the progress and message keys are
@@ -108,7 +104,7 @@ const waitUp = async (base) => { for (let i = 0; i < 80; i++) { try { await fetc
     const tAdmin = jwt.sign({ id: adminId, role: "admin" }, SECRET, { expiresIn: "1h" });
     const tCust = jwt.sign({ id: custId, role: "customer" }, SECRET, { expiresIn: "1h" });
 
-    okServer = startServer(OK_PORT);
+    okServer = await startServer(OK_PORT);
     check("M1. healthy test instance started", await waitUp(API));
 
     /* ---------- maintenance OFF baseline ---------- */
@@ -255,7 +251,7 @@ const waitUp = async (base) => { for (let i = 0; i < 80; i++) { try { await fetc
     // guard must treat that as OFF. A customer route will still fail on its own
     // database access, but it must NOT be a maintenance 503 — that is the
     // difference between "a query broke" and "we took the whole site down".
-    deadServer = startServer(DEAD_DB_PORT, { DB_HOST: "127.0.0.1", DB_PORT: "1" });
+    deadServer = await startServer(DEAD_DB_PORT, { noDb: true });
     check("M38. instance with an unreachable database started", await waitUp(DEAD));
     r = await call(DEAD, "GET", "/api/products");
     check("M39. FAIL OPEN: settings read failure does not produce a maintenance 503", !(r.data && r.data.code === "MAINTENANCE_MODE"), `${r.status} ${r.data && r.data.code}`);
@@ -264,7 +260,7 @@ const waitUp = async (base) => { for (let i = 0; i < 80; i++) { try { await fetc
     r = await call(DEAD, "GET", "/api/health");
     check("M41. health still answers (503 unavailable) and is not hidden behind maintenance", r.status === 503 && r.data.database === "unavailable", JSON.stringify(r.data));
 
-    check("M42. neither test server crashed", okServer.exitCode === null && deadServer.exitCode === null, `ok=${okServer.exitCode} dead=${deadServer.exitCode}`);
+    check("M42. neither test server crashed", okServer.proc.exitCode === null && deadServer.proc.exitCode === null, `ok=${okServer.proc.exitCode} dead=${deadServer.proc.exitCode}`);
 
     /* ================================================================
        PROGRESS + MESSAGE (the Phase 2 enhancement)
@@ -438,7 +434,7 @@ const waitUp = async (base) => { for (let i = 0; i < 80; i++) { try { await fetc
     /* ---------- leave it off ---------- */
     await call(API, "POST", "/api/admin/system/maintenance/off", tAdmin);
     check("M79. maintenance left OFF after the configuration tests", (await call(API, "GET", "/api/system/status")).data.maintenance === false);
-    check("M80. neither test server crashed during the configuration tests", okServer.exitCode === null && deadServer.exitCode === null, `ok=${okServer.exitCode} dead=${deadServer.exitCode}`);
+    check("M80. neither test server crashed during the configuration tests", okServer.proc.exitCode === null && deadServer.proc.exitCode === null, `ok=${okServer.proc.exitCode} dead=${deadServer.proc.exitCode}`);
   } catch (err) {
     console.error("TEST HARNESS ERROR:", err);
     results.push(false);
@@ -466,8 +462,8 @@ const waitUp = async (base) => { for (let i = 0; i < 80; i++) { try { await fetc
     } catch (e) { console.error("CLEANUP ERROR:", e.message); results.push(false); }
     try { ws && ws.close(); } catch (e) {}
     if (edge) edge.kill();
-    if (okServer) okServer.kill();
-    if (deadServer) deadServer.kill();
+    iso.stopServer(okServer);
+    iso.stopServer(deadServer);
     await pool.end();
     const failed = results.filter(r => !r).length;
     console.log(`\n${results.length - failed}/${results.length} passed${failed ? ` — ${failed} FAILED` : ""}`);

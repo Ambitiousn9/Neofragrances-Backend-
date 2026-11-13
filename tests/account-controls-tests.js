@@ -32,6 +32,10 @@
 const path = require("path"), fs = require("fs"), os = require("os"), crypto = require("crypto");
 const { spawn } = require("child_process");
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
+// T04: runs ONLY under the isolated-database guard (nf_test_* on 127.0.0.1:3308; see
+// tests/README.md, "Isolated test database"). Checked before dotenv and db.js load.
+const iso = require("./support/isolated-suite");
+iso.requireIsolation("account-controls-tests.js");
 require(path.join(process.cwd(), "node_modules/dotenv")).config({ quiet: true });
 const jwt = require(path.join(process.cwd(), "node_modules/jsonwebtoken"));
 const bcrypt = require(path.join(process.cwd(), "node_modules/bcrypt"));
@@ -42,10 +46,6 @@ process.env.ACCOUNT_CACHE_MAX = "3";
 const pool = require(path.join(process.cwd(), "db"));
 const accounts = require(path.join(process.cwd(), "accounts"));
 // Safety gate — never weaken this.
-if (!["localhost", "127.0.0.1"].includes(process.env.DB_HOST) || process.env.DB_NAME !== "neofragrances") {
-  console.error("Refusing to run: not the local database.");
-  process.exit(1);
-}
 
 const OK_PORT = 5071, DEAD_DB_PORT = 5072, CDP_PORT = 9343;
 const API = `http://127.0.0.1:${OK_PORT}`;
@@ -71,17 +71,16 @@ const call = async (base, method, url, token, body) => {
   return { status: res.status, data, text };
 };
 
-const startServer = (port, extraEnv = {}) => spawn(process.execPath, ["server.js"], {
-  env: Object.assign({}, process.env, {
-    PORT: String(port), JWT_SECRET: SECRET, SENDGRID_API_KEY: "",
-    PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", DEV_EMAIL_LOG: "true",
-    FRONTEND_URL: FRONT, NODE_ENV: "", ACCOUNT_CACHE_MAX: "",
-  }, extraEnv),
-  stdio: "ignore",
+// A guarded child on the nf_test_* database, or (noDb) a child with no database at all
+// (127.0.0.1:1, no-database preload) for the unreachable-database cases.
+const startServer = (port, { noDb = false } = {}) => (noDb ? iso.startNoDbServer : iso.startGuardedServer)({
+  suite: "account-controls-tests.js", port,
+  env: { JWT_SECRET: SECRET, SENDGRID_API_KEY: "", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", DEV_EMAIL_LOG: "true", FRONTEND_URL: FRONT, NODE_ENV: "", ACCOUNT_CACHE_MAX: "" },
 });
 const waitUp = async (base) => { for (let i = 0; i < 80; i++) { try { await fetch(base + "/"); return true; } catch (e) { await sleep(200); } } return false; };
 
 (async () => {
+  await iso.verifyParentIdentity(pool, "account-controls-tests.js");
   let okServer, deadServer, edge, ws, adminId, custId, otherId, productId, productName;
   try {
     const stamp = Date.now();
@@ -102,7 +101,7 @@ const waitUp = async (base) => { for (let i = 0; i < 80; i++) { try { await fetc
     const tCust = jwt.sign({ id: custId, role: "customer" }, SECRET, { expiresIn: "1h" });
     const forged = jwt.sign({ id: custId, role: "admin" }, SECRET);
 
-    okServer = startServer(OK_PORT);
+    okServer = await startServer(OK_PORT);
     check("A1. healthy test instance started", await waitUp(API));
 
     /* ================= migration 005 schema ================= */
@@ -335,7 +334,7 @@ const waitUp = async (base) => { for (let i = 0; i < 80; i++) { try { await fetc
     await q("UPDATE users SET disabled_at = NULL WHERE id = ?", [custId]);
 
     /* ================= fail open, end to end ================= */
-    deadServer = startServer(DEAD_DB_PORT, { DB_HOST: "127.0.0.1", DB_PORT: "1" });
+    deadServer = await startServer(DEAD_DB_PORT, { noDb: true });
     check("A66. instance with an unreachable database started", await waitUp(DEAD));
     r = await call(DEAD, "GET", "/api/me", tCust);
     check("A67. FAIL OPEN: a status read failure does not produce ACCOUNT_DISABLED for everyone",
@@ -470,7 +469,7 @@ const waitUp = async (base) => { for (let i = 0; i < 80; i++) { try { await fetc
     await shot("04-storefront-session-cleared");
     await call(API, "PATCH", path405, tAdmin, { disabled: false });
 
-    check("A86. neither test server crashed", okServer.exitCode === null && deadServer.exitCode === null, `ok=${okServer.exitCode} dead=${deadServer.exitCode}`);
+    check("A86. neither test server crashed", okServer.proc.exitCode === null && deadServer.proc.exitCode === null, `ok=${okServer.proc.exitCode} dead=${deadServer.proc.exitCode}`);
   } catch (err) {
     console.error("TEST HARNESS ERROR:", err);
     results.push(false);
@@ -493,8 +492,8 @@ const waitUp = async (base) => { for (let i = 0; i < 80; i++) { try { await fetc
     } catch (e) { console.error("CLEANUP ERROR:", e.message); results.push(false); }
     try { ws && ws.close(); } catch (e) {}
     if (edge) edge.kill();
-    if (okServer) okServer.kill();
-    if (deadServer) deadServer.kill();
+    iso.stopServer(okServer);
+    iso.stopServer(deadServer);
     await pool.end();
     const failed = results.filter(r => !r).length;
     console.log(`\n${results.length - failed}/${results.length} passed${failed ? ` — ${failed} FAILED` : ""}`);

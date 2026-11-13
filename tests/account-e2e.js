@@ -5,6 +5,10 @@ const { spawn } = require("child_process");
 // This file lives in <repo>/tests, so default to the repo root above it: the suite then
 // runs as `node tests/<file>` with nothing set. An explicit SERVER_DIR still wins.
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
+// T04: runs ONLY under the isolated-database guard (nf_test_* on 127.0.0.1:3308; see
+// tests/README.md, "Isolated test database"). Checked before dotenv and db.js load.
+const iso = require("./support/isolated-suite");
+iso.requireIsolation("account-e2e.js");
 require(path.join(process.cwd(), "node_modules/dotenv")).config({ quiet: true });
 const jwt = require(path.join(process.cwd(), "node_modules/jsonwebtoken"));
 const bcrypt = require(path.join(process.cwd(), "node_modules/bcrypt"));
@@ -18,6 +22,7 @@ const results = []; const check = (n, c, x = "") => { results.push(!!c); console
 const SHOTS = path.join(__dirname, "m4-shots"); fs.mkdirSync(SHOTS, { recursive: true });
 
 (async () => {
+  await iso.verifyParentIdentity(pool, "account-e2e.js");
   const stamp = Date.now(); const ids = []; const orderIds = [];
   let server, edge, ws;
   try {
@@ -42,8 +47,7 @@ const SHOTS = path.join(__dirname, "m4-shots"); fs.mkdirSync(SHOTS, { recursive:
     const tok = id => jwt.sign({ id, role: "customer" }, SECRET, { expiresIn: "1h" });
 
     /* ---------- server + browser ---------- */
-    server = spawn(process.execPath, ["server.js"], { env: { ...process.env, PORT: 5057, JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", SENDGRID_API_KEY: "", FRONTEND_URL: FRONT, NODE_ENV: "" }, stdio: "ignore" });
-    for (let i = 0; i < 60; i++) { try { await fetch(API + "/"); break; } catch (e) { await sleep(200); } }
+    server = await iso.startGuardedServer({ suite: "account-e2e.js", port: 5057, env: { JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", SENDGRID_API_KEY: "", FRONTEND_URL: FRONT, NODE_ENV: "" } });
     const profile = path.join(os.tmpdir(), "nf-edge-m4"); fs.rmSync(profile, { recursive: true, force: true });
     edge = spawn("C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", ["--headless=new", "--remote-debugging-port=9337", `--user-data-dir=${profile}`, "--no-first-run", "about:blank"], { stdio: "ignore" });
     let wsUrl; for (let i = 0; i < 150 && !wsUrl; i++) { try { wsUrl = (await (await fetch("http://127.0.0.1:9337/json/list")).json()).find(t => t.type === "page")?.webSocketDebuggerUrl; } catch (e) {} if (!wsUrl) await sleep(200); }
@@ -68,7 +72,10 @@ const SHOTS = path.join(__dirname, "m4-shots"); fs.mkdirSync(SHOTS, { recursive:
     const waitFor = async (e, ms = 8000) => { for (let t = 0; t < ms; t += 150) { if (await ev(e)) return true; await sleep(150); } return false; };
     const lastNet = (pathPart, method) => [...net].reverse().find(n => n.path.startsWith(pathPart) && (!method || n.method === method));
     const shot = async name => { const r = await send("Page.captureScreenshot", { format: "png", captureBeyondViewport: false }); fs.writeFileSync(path.join(SHOTS, name + ".png"), Buffer.from(r.result.data, "base64")); };
-    const loginAs = async (uid, user) => { await go(`${FRONT}/index.html`); await ev(`localStorage.setItem("neofragrances_auth", ${JSON.stringify(JSON.stringify({ token: tok(uid), user }))}); localStorage.removeItem("neofragrances_cart"); true`); };
+    // Mints the session the way a real sign-in would, with the account's CURRENT token_version
+    // (claim v): since G-1 a password change ends earlier sessions, so a v-less token minted
+    // after step 7 would be rejected.
+    const loginAs = async (uid, user) => { const v = Number((await q("SELECT token_version FROM users WHERE id = ?", [uid]))[0].token_version) || 0; const t = jwt.sign({ id: uid, role: "customer", v }, SECRET, { expiresIn: "1h" }); await go(`${FRONT}/index.html`); await ev(`localStorage.setItem("neofragrances_auth", ${JSON.stringify(JSON.stringify({ token: t, user }))}); localStorage.removeItem("neofragrances_cart"); true`); };
     const click = sel => ev(`(()=>{const e=document.querySelector(${JSON.stringify(sel)}); if(!e) return false; e.click(); return true;})()`);
     const noOverflow = () => ev(`document.documentElement.scrollWidth <= window.innerWidth + 1`);
 
@@ -293,7 +300,7 @@ const SHOTS = path.join(__dirname, "m4-shots"); fs.mkdirSync(SHOTS, { recursive:
       console.log("\ncleanup:", JSON.stringify(c));
     } catch (e) { console.error("CLEANUP ERROR", e.message); }
     try { ws && ws.close(); } catch (e) {}
-    if (edge) edge.kill(); if (server) server.kill(); await pool.end();
+    if (edge) edge.kill(); iso.stopServer(server); await pool.end();
     const failed = results.filter(r => !r).length;
     console.log(`\n${results.length - failed}/${results.length} passed${failed ? ` — ${failed} FAILED` : ""}`);
     process.exit(failed ? 1 : 0);

@@ -17,11 +17,17 @@ const { spawn } = require("child_process");
 // This file lives in <repo>/tests, so default to the repo root above it: the suite then
 // runs as `node tests/<file>` with nothing set. An explicit SERVER_DIR still wins.
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
+// T04: runs ONLY under the isolated-database guard (nf_test_* on 127.0.0.1:3308; see
+// tests/README.md, "Isolated test database"). Checked before dotenv and db.js load.
+const iso = require("./support/isolated-suite");
+iso.requireIsolation("restore-app-verify.js");
 require(path.join(process.cwd(), "node_modules/dotenv")).config({ quiet: true });
 const jwt = require(path.join(process.cwd(), "node_modules/jsonwebtoken"));
 const pool = require(path.join(process.cwd(), "db"));
 if (!["localhost", "127.0.0.1"].includes(process.env.DB_HOST)) { console.error("not local"); process.exit(1); }
-const FRONT = "http://127.0.0.1:5500", MAIN = "http://localhost:5000", API = "http://127.0.0.1:5070";
+// T04: the public-API checks used to read the user's running backend (localhost:5000), which
+// serves the WORKING database. Under isolation they read this suite's own guarded instance.
+const FRONT = "http://127.0.0.1:5500", API = "http://127.0.0.1:5070", MAIN = API;
 const SECRET = crypto.randomBytes(32).toString("hex");
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const q = async (s, p) => (await pool.query(s, p))[0];
@@ -31,10 +37,13 @@ const CATALOG_SQL = "SELECT (SELECT COUNT(*) FROM products) p, (SELECT COUNT(*) 
 const MOJI = /Ã|Â|â€|ΓÇ|â‚µ|ï¿½|\uFFFD/;
 
 (async () => {
+  await iso.verifyParentIdentity(pool, "restore-app-verify.js");
   const before = (await q(CATALOG_SQL))[0];
   let server, edge, ws, adminId;
   try {
-    /* ---------- public API on the running backend (:5000) ---------- */
+    // Guarded instance first (T04): the public checks below read it instead of :5000.
+    server = await iso.startGuardedServer({ suite: "restore-app-verify.js", port: 5070, env: { JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", FRONTEND_URL: FRONT, NODE_ENV: "" } });
+    /* ---------- public API on this suite's own guarded instance (:5070) ---------- */
     const products = await (await fetch(`${MAIN}/api/products`)).json();
     const ids = new Set(products.map(p => p.id));
     check("GET /api/products → 166 active products", products.length === 166, products.length);
@@ -83,8 +92,6 @@ const MOJI = /Ã|Â|â€|ΓÇ|â‚µ|ï¿½|\uFFFD/;
     /* ---------- admin API (second instance, temporary admin) ---------- */
     adminId = (await q("INSERT INTO users (full_name, email, password_hash, role, email_verified_at, auth_provider) VALUES ('Restore Check Admin', ?, NULL, 'admin', NOW(), 'local')", [`nf-restore-admin-${Date.now()}@example.invalid`])).insertId;
     const tok = jwt.sign({ id: adminId, role: "admin" }, SECRET, { expiresIn: "1h" });
-    server = spawn(process.execPath, ["server.js"], { env: { ...process.env, PORT: 5070, JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true", PAYSTACK_SECRET_KEY: "", GOOGLE_CLIENT_ID: "", FRONTEND_URL: FRONT, NODE_ENV: "" }, stdio: "ignore" });
-    for (let i = 0; i < 60; i++) { try { await fetch(API + "/"); break; } catch (e) { await sleep(200); } }
     const adm = async p => (await fetch(API + p, { headers: { Authorization: `Bearer ${tok}` } })).json();
     const ap = await adm("/api/admin/products");
     const archived = ap.filter(p => p.deleted_at);
@@ -207,7 +214,7 @@ const MOJI = /Ã|Â|â€|ΓÇ|â‚µ|ï¿½|\uFFFD/;
     console.error("HARNESS ERROR:", e); results.push(false);
   } finally {
     try { ws && ws.close(); } catch (e) {}
-    if (edge) edge.kill(); if (server) server.kill();
+    if (edge) edge.kill(); iso.stopServer(server);
     if (adminId) await q("DELETE FROM users WHERE id = ?", [adminId]);
     const after = (await q(CATALOG_SQL))[0];
     check("catalog unchanged by verification + temporary admin removed", JSON.stringify(before) === JSON.stringify(after), JSON.stringify(after));

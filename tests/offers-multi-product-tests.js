@@ -37,6 +37,10 @@ const path = require("path"), fs = require("fs"), os = require("os"), crypto = r
 const { spawn } = require("child_process");
 // This file lives in <repo>/tests, so default to the repo root above it.
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
+// T04: runs ONLY under the isolated-database guard (nf_test_* on 127.0.0.1:3308; see
+// tests/README.md, "Isolated test database"). Checked before dotenv and db.js load.
+const iso = require("./support/isolated-suite");
+iso.requireIsolation("offers-multi-product-tests.js");
 require(path.join(process.cwd(), "node_modules/dotenv")).config({ quiet: true });
 const jwt = require(path.join(process.cwd(), "node_modules/jsonwebtoken"));
 const pool = require(path.join(process.cwd(), "db"));
@@ -70,6 +74,7 @@ const RESTORED_SQL = `SELECT o.*, op.id AS op_id, op.product_id, op.original_pri
   FROM offers o JOIN offer_products op ON op.offer_id = o.id WHERE o.id IN (1, 30002) ORDER BY o.id`;
 
 (async () => {
+  await iso.verifyParentIdentity(pool, "offers-multi-product-tests.js");
   const stamp = Date.now();
   const fx = { users: [], products: [], offers: [] };
   const before = await snapshot();
@@ -88,8 +93,7 @@ const RESTORED_SQL = `SELECT o.*, op.id AS op_id, op.product_id, op.original_pri
     fx.users.push(ADMIN);
     const tA = jwt.sign({ id: ADMIN, role: "admin" }, SECRET);
 
-    server = spawn(process.execPath, ["server.js"], { env: { ...process.env, PORT: 5074, JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true" }, stdio: "ignore" });
-    for (let i = 0; i < 60; i++) { try { await fetch(API + "/"); break; } catch (e) { await sleep(200); } }
+    server = await iso.startGuardedServer({ suite: "offers-multi-product-tests.js", port: 5074, env: { JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true" } });
 
     const start = new Date(Date.now() - 3600e3).toISOString().slice(0, 19).replace("T", " ");
     const end = new Date(Date.now() + 86400e3).toISOString().slice(0, 19).replace("T", " ");
@@ -807,7 +811,7 @@ const RESTORED_SQL = `SELECT o.*, op.id AS op_id, op.product_id, op.original_pri
     } catch (e) { console.error("CLEANUP ERROR", e.message); results.push(false); }
     try { ws && ws.close(); } catch (e) {}
     if (edge) edge.kill();
-    if (server) server.kill(); await pool.end();
+    iso.stopServer(server); await pool.end();
     const failed = results.filter(r => !r).length;
     console.log(`\n${results.length - failed}/${results.length} passed${failed ? ` — ${failed} FAILED` : ""}`);
     process.exit(failed ? 1 : 0);
