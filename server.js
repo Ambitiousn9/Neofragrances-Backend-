@@ -13,6 +13,7 @@ const maintenanceSettings = require("./settings");
 const accounts = require("./accounts");
 const { createRateLimiter, createLoginThrottle } = require("./rate-limit");
 const { securityHeaders } = require("./security-headers");
+const paymentIssues = require("./payment-issues");
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 
 if (!GOOGLE_CLIENT_ID) {
@@ -193,6 +194,20 @@ app.get("/api/config/google-client-id", (req, res) => {
 const ACCOUNT_DISABLED_MESSAGE = "Your account has been disabled. Please contact support if you think this is a mistake.";
 const SESSION_INVALIDATED_MESSAGE = "Your session is no longer valid. Please log in again.";
 
+// Session lifetimes (ADMIN-3). Picked from the DATABASE role at sign-in, so an
+// administrator gets a working-day session on every sign-in path (password and
+// Google); every other account keeps the 7-day session it always had. The claims
+// are unchanged: { id, role, v } — v is users.token_version, checked by authenticate().
+const ADMIN_TOKEN_TTL = "12h";
+const CUSTOMER_TOKEN_TTL = "7d";
+function signSessionToken(user) {
+  return jwt.sign(
+    { id: user.id, role: user.role, v: Number(user.token_version) || 0 },
+    process.env.JWT_SECRET,
+    { expiresIn: user.role === "admin" ? ADMIN_TOKEN_TTL : CUSTOMER_TOKEN_TTL }
+  );
+}
+
 // `allowDisabled` is used by exactly ONE route: settling a payment the customer
 // has already been charged for. Nothing else may opt out.
 function authenticate({ allowDisabled }) {
@@ -361,7 +376,7 @@ app.post("/api/login", async (req, res) => {
       return res.status(403).json({ error: ACCOUNT_DISABLED_MESSAGE, code: "ACCOUNT_DISABLED" });
     }
 
-    const token = jwt.sign({ id: user.id, role: user.role, v: Number(user.token_version) || 0 }, process.env.JWT_SECRET, { expiresIn: "7d" });
+    const token = signSessionToken(user);
 
     // Success clears Tier A for this IP + email only; Tier B is left to expire.
     loginThrottle.recordSuccess(req.ip, email);
@@ -481,20 +496,10 @@ app.post("/api/auth/google", async (req, res) => {
       );
     }
 
-    // Generate the same JWT used by normal NeoFragrances login
-    const token = jwt.sign(
-      {
-        id: user.id,
-        role: user.role,
-        // A user created moments ago has no token_version property on the
-        // literal built above; || 0 is the same value the column defaults to.
-        v: Number(user.token_version) || 0,
-      },
-      process.env.JWT_SECRET,
-      {
-        expiresIn: "7d",
-      }
-    );
+    // Same JWT as normal NeoFragrances login, including its role-based lifetime.
+    // A user created moments ago has no token_version property on the literal
+    // built above; signSessionToken reads it as 0, the column default.
+    const token = signSessionToken(user);
 
     res.json({
       token,
@@ -798,6 +803,16 @@ app.get("/api/admin/summary", requireAdmin, async (req, res) => {
          FROM users WHERE role = 'customer'`);
     const [offerRows] = await pool.query("SELECT start_at, end_at, active FROM offers");
     const [[reviews]] = await pool.query("SELECT COUNT(*) AS total, AVG(rating) AS avg_rating FROM reviews");
+    // Open payment issues for the admin badge. payment_issues comes from migration 009,
+    // which may not be applied yet: ONLY "table doesn't exist" is tolerated (reported as
+    // null); every other error still fails the summary exactly as before.
+    let openPaymentIssues = null;
+    try {
+      const [[pi]] = await pool.query("SELECT COUNT(*) AS n FROM payment_issues WHERE status = 'open'");
+      openPaymentIssues = Number(pi.n) || 0;
+    } catch (err) {
+      if (!(err && (err.code === "ER_NO_SUCH_TABLE" || err.errno === 1146))) throw err;
+    }
     const [recentOrders] = await pool.query(
       `SELECT o.id, o.total, o.status, o.created_at, u.full_name AS customer_name,
               (SELECT COALESCE(SUM(quantity), 0) FROM order_items oi WHERE oi.order_id = o.id) AS item_count
@@ -840,6 +855,7 @@ app.get("/api/admin/summary", requireAdmin, async (req, res) => {
       recent_orders: recentOrders.map(o => ({ ...o, item_count: n(o.item_count) })),
       low_stock_products: lowStock,
       recent_reviews: recentReviews,
+      payment_issues: { open: openPaymentIssues },
     });
   } catch (err) {
     console.error(err);
@@ -1389,6 +1405,63 @@ app.patch("/api/admin/customers/:id/disabled", requireAdmin, async (req, res) =>
     res.status(500).json({ error: "Could not update the account." });
   } finally {
     connection.release();
+  }
+});
+
+// ---------- Admin: logout (ADMIN-3) ----------
+/* Server-side logout through the existing token_version mechanism: the version is
+   bumped in one locked transaction, so EVERY token issued to this administrator
+   before now fails authenticate()'s version check from the next request on — all
+   devices, and the storefront session that shares the same stored login. There is
+   no per-session revocation without a session table.
+
+   Propagation: the account-status cache on THIS process is seeded with the new
+   version right after commit. Other server instances keep their own cache and catch
+   up within accounts.TTL_MS (7 s). If the database is unreachable and an instance
+   has nothing cached, authenticate() skips the version check (accounts.js fails
+   open by design), so a revoked token can pass there until the database is back.
+
+   Under /api/admin/, so the maintenance guard bypasses it and logout keeps working
+   while maintenance is on. Success is reported only after the increment commits. */
+app.post("/api/admin/logout", requireAdmin, async (req, res) => {
+  const id = Number(req.user.id);
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    const [rows] = await connection.query(
+      "SELECT id, disabled_at, token_version FROM users WHERE id = ? FOR UPDATE", [id]);
+    if (!rows.length) {
+      await connection.rollback();
+      return res.status(401).json({ error: "Your session has expired. Please log in again." });
+    }
+    const [result] = await connection.query(
+      "UPDATE users SET token_version = token_version + 1 WHERE id = ?", [id]);
+    if (result.affectedRows !== 1) throw new Error("token_version was not incremented");
+    const [after] = await connection.query(
+      "SELECT disabled_at, token_version FROM users WHERE id = ?", [id]);
+    await connection.commit();
+
+    // Committed: the revocation is durable. Seed this process's cache with the
+    // authoritative new state; a failure here must not turn a committed logout
+    // into an error response (the cache would catch up within its TTL anyway).
+    try {
+      const saved = after[0];
+      accounts.invalidateAccountStatus(id, {
+        disabled: saved.disabled_at !== null && saved.disabled_at !== undefined,
+        tokenVersion: Number(saved.token_version) || 0,
+      });
+    } catch (cacheErr) {
+      console.error("admin logout: account cache update failed:", cacheErr.message);
+    }
+    console.warn(`Admin id ${id} logged out; their sessions were revoked.`);
+    res.json({ success: true });
+  } catch (err) {
+    if (connection) await connection.rollback().catch(() => {});
+    console.error("admin logout failed:", err.code || err.message);
+    res.status(500).json({ error: "Could not complete logout on the server." });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -2159,7 +2232,7 @@ app.post("/api/reset-password", async (req, res) => {
 // Every amount comes from pricing.js (server-side, integer pesewas). Prices or
 // totals sent by the browser are never trusted.
 const PAYSTACK_API_BASE = process.env.PAYSTACK_API_BASE || "https://api.paystack.co";
-const PAYMENT_REFERENCE_PATTERN = /^NF-[A-Za-z0-9-]{8,80}$/;
+const PAYMENT_REFERENCE_PATTERN = /^NF-[a-z0-9-]{8,80}$/;
 
 // Outbound Paystack calls are bounded so a slow or hung Paystack can never hold a
 // request open indefinitely (the runtime default would wait minutes). Paystack
@@ -2248,15 +2321,18 @@ app.post("/api/payments/initialize", requireAuth, async (req, res) => {
     const [userRows] = await pool.query("SELECT email FROM users WHERE id = ?", [req.user.id]);
     if (userRows.length === 0) return res.status(404).json({ error: "User not found." });
 
-    // A delivery address, when given, must belong to this customer.
-    let validAddressId = null;
-    if (addressId !== undefined && addressId !== null && addressId !== "") {
-      const [addr] = await pool.query("SELECT id FROM addresses WHERE id = ? AND user_id = ?", [Number(addressId) || 0, req.user.id]);
-      if (addr.length === 0) {
-        return res.status(400).json({ error: "Please choose one of your saved delivery addresses.", code: "INVALID_ADDRESS" });
-      }
-      validAddressId = addr[0].id;
+    // Every new payment needs a delivery address, and it must belong to this customer.
+    // Checked before pricing or Paystack, so nothing is started without one. Settlement
+    // still accepts a snapshot without an address: such a payment was started before
+    // this rule and has already been charged.
+    if (addressId === undefined || addressId === null || addressId === "") {
+      return res.status(400).json({ error: "Please add or choose a delivery address.", code: "ADDRESS_REQUIRED" });
     }
+    const [addr] = await pool.query("SELECT id FROM addresses WHERE id = ? AND user_id = ?", [Number(addressId) || 0, req.user.id]);
+    if (addr.length === 0) {
+      return res.status(400).json({ error: "Please choose one of your saved delivery addresses.", code: "INVALID_ADDRESS" });
+    }
+    const validAddressId = addr[0].id;
 
     const pricing = await priceCart(pool, { items, couponId });
     const reference = `NF-${Date.now()}-${req.user.id}-${crypto.randomBytes(4).toString("hex")}`;
@@ -2336,7 +2412,12 @@ function isDuplicatePaymentReference(err) {
    session, and authenticates the payment through the signed snapshot plus the
    server-to-server verification below. */
 async function settlePayment(reference, { requireUserId = null } = {}) {
-  const reject = (status, code, error, details) => ({ outcome: "rejected", status, code, error, details });
+  // Trusted evidence for the payment-issue register (payment-issues.js). It stays null
+  // until Paystack's server-to-server verification says "success"; the snapshot-derived
+  // fields are filled only after the snapshot's signature and reference checks pass.
+  // It is attached to every later outcome but never sent to the browser or Paystack.
+  let evidence = null;
+  const reject = (status, code, error, details) => ({ outcome: "rejected", status, code, error, details, evidence });
   const lockName = `nf_pay_${reference}`.slice(0, 64);
   let connection = null;
   let lockHeld = false;
@@ -2357,9 +2438,14 @@ async function settlePayment(reference, { requireUserId = null } = {}) {
       return reject(400, "PAYMENT_NOT_SUCCESSFUL", "Payment was not successful.", { paystackStatus: verified.status });
     }
     const tx = verified.tx;
+    // Amount and currency are attached only once Paystack's transaction is confirmed to
+    // be THIS reference; on a reference mismatch they belong to some other transaction.
+    evidence = { paystackVerified: true, amountPesewas: null, currency: null, snapshotValid: false, userId: null, expectedTotal: null };
     if (tx.reference !== reference) {
       return reject(400, "REFERENCE_MISMATCH", "Payment reference mismatch.");
     }
+    evidence.amountPesewas = paymentIssues.parseAmountPesewas(tx.amount);
+    evidence.currency = typeof tx.currency === "string" ? tx.currency : null;
     if (tx.currency !== CURRENCY) {
       console.error("Payment currency mismatch:", reference, tx.currency);
       return reject(400, "CURRENCY_MISMATCH", "Payment currency mismatch.");
@@ -2373,6 +2459,10 @@ async function settlePayment(reference, { requireUserId = null } = {}) {
       console.error("Payment metadata missing or tampered:", reference);
       return reject(400, "PAYMENT_METADATA_INVALID", "This payment could not be matched to an order.", { reference });
     }
+    // Signature and reference verified: only now may snapshot values be trusted.
+    evidence.snapshotValid = true;
+    evidence.userId = Number.isInteger(Number(snapshot.userId)) ? Number(snapshot.userId) : null;
+    evidence.expectedTotal = Number.isInteger(Number(snapshot.total)) ? Number(snapshot.total) : null;
     // Browser flow only: the signed-in customer must be the one who paid.
     if (requireUserId !== null && Number(snapshot.userId) !== Number(requireUserId)) {
       return reject(403, "PAYMENT_USER_MISMATCH", "This payment belongs to a different account.");
@@ -2397,12 +2487,27 @@ async function settlePayment(reference, { requireUserId = null } = {}) {
     let orderId;
     await connection.beginTransaction();
     try {
+      // PI-06: the delivery address chosen at checkout may have been deleted since
+      // (unused addresses can be). Never substitute another one: stop with a clear code
+      // instead of letting the orders.address_id foreign key fail as a generic error.
+      if (snapshot.addressId !== null && snapshot.addressId !== undefined) {
+        const [addr] = await connection.query("SELECT id FROM addresses WHERE id = ? AND user_id = ?", [snapshot.addressId, snapshot.userId]);
+        if (!addr.length) {
+          throw new PricingError(409, "PAID_ADDRESS_MISSING", "Your payment was received, but the delivery address chosen for it no longer exists. Please contact us with your payment reference and we'll resolve it.", { reference });
+        }
+      }
       for (const line of snapshot.lines) {
         const [result] = await connection.query(
           "UPDATE products SET stock_qty = stock_qty - ? WHERE id = ? AND deleted_at IS NULL AND stock_qty >= ?",
           [line.qty, line.productId, line.qty]
         );
         if (result.affectedRows !== 1) {
+          // PI-06: tell an archived (or missing) product apart from a sold-out one.
+          // Neither is substituted or re-priced; the order is simply not created.
+          const [prodRows] = await connection.query("SELECT deleted_at FROM products WHERE id = ?", [line.productId]);
+          if (!prodRows.length || prodRows[0].deleted_at) {
+            throw new PricingError(409, "PAID_PRODUCT_UNAVAILABLE", "A product in this payment is no longer available.", { productId: line.productId });
+          }
           throw new PricingError(409, "PAID_OUT_OF_STOCK", "Out of stock after payment.", { productId: line.productId });
         }
       }
@@ -2460,12 +2565,12 @@ async function settlePayment(reference, { requireUserId = null } = {}) {
 
     return { outcome: "created", orderId, total: toCedis(snapshot.total) };
   } catch (err) {
-    if (err instanceof PricingError && err.code === "PAID_OUT_OF_STOCK") {
-      console.error("PAID BUT OUT OF STOCK — needs manual resolution:", reference, err.details);
-      return { outcome: "out_of_stock", code: err.code, details: err.details };
+    if (err instanceof PricingError && (err.code === "PAID_OUT_OF_STOCK" || err.code === "PAID_PRODUCT_UNAVAILABLE")) {
+      console.error("PAID BUT NOT FULFILLABLE — needs manual resolution:", reference, err.code, err.details);
+      return { outcome: "out_of_stock", code: err.code, details: err.details, evidence };
     }
     if (err instanceof PricingError) {
-      return { outcome: "rejected", status: err.status, code: err.code, error: err.message, details: err.details };
+      return { outcome: "rejected", status: err.status, code: err.code, error: err.message, details: err.details, evidence };
     }
     // The UNIQUE index rejected a second order for this reference, so a concurrent
     // settlement won the race. The transaction above has already rolled back: no
@@ -2484,13 +2589,34 @@ async function settlePayment(reference, { requireUserId = null } = {}) {
       // No order to return — the competing transaction rolled back too, or the
       // re-read failed. Fall through to the transient failure below.
     }
-    return { outcome: "error", err };
+    return { outcome: "error", err, evidence };
   } finally {
     if (connection) {
       if (lockHeld) await connection.query("SELECT RELEASE_LOCK(?)", [lockName]).catch(() => {});
       connection.release();
     }
   }
+}
+
+/* ---------- Settlement + payment-issue register (Stage B) ----------
+   settlePayment() decides everything about money and orders. This wrapper only
+   records what happened in payment_issues (payment-issues.js) AFTER settlement has
+   finished — outside its transaction, after any rollback, after the lock is released.
+   The issue write is best effort: any failure (including migration 009 not being
+   applied yet) is caught and logged by code only, and the caller still answers from
+   the untouched settlement result. No GET_LOCK is involved here; one row per
+   reference is enforced by the table's UNIQUE key.
+   signedWebhook must be true only after verifyPaystackSignature() passed. */
+async function settleAndRecord(reference, { requireUserId = null, source, signedWebhook = false, resolvedBy = null } = {}) {
+  const result = await settlePayment(reference, { requireUserId });
+  try {
+    await paymentIssues.recordFromSettlement(pool, reference, result, {
+      source, signedWebhook, resolvedBy, referencePattern: PAYMENT_REFERENCE_PATTERN,
+    });
+  } catch (err) {
+    console.error("Payment issue could not be recorded:", reference, (err && (err.code || err.message)) || "unknown error");
+  }
+  return result;
 }
 
 // Paystack signs the raw request body with HMAC-SHA512 keyed on the secret key and
@@ -2531,7 +2657,7 @@ app.get("/api/payments/verify/:reference", requireAuthAllowDisabled, async (req,
   if (!PAYMENT_REFERENCE_PATTERN.test(reference)) {
     return res.status(400).json({ error: "Invalid payment reference.", code: "INVALID_REFERENCE" });
   }
-  const result = await settlePayment(reference, { requireUserId: req.user.id });
+  const result = await settleAndRecord(reference, { requireUserId: req.user.id, source: "callback" });
   switch (result.outcome) {
     case "created":
       return res.status(201).json({ orderId: result.orderId, total: result.total });
@@ -2541,7 +2667,9 @@ app.get("/api/payments/verify/:reference", requireAuthAllowDisabled, async (req,
       return res.status(result.status).json({ error: result.error, code: result.code, ...(result.details || {}) });
     case "out_of_stock":
       return res.status(409).json({
-        error: "Your payment was received, but an item sold out before we could reserve it. Please contact us with your payment reference and we'll resolve it.",
+        error: result.code === "PAID_PRODUCT_UNAVAILABLE"
+          ? "Your payment was received, but an item is no longer available. Please contact us with your payment reference and we'll resolve it."
+          : "Your payment was received, but an item sold out before we could reserve it. Please contact us with your payment reference and we'll resolve it.",
         code: result.code, reference,
       });
     case "pending":
@@ -2616,7 +2744,8 @@ app.post(PAYMENT_WEBHOOK_PATH, async (req, res) => {
     return res.status(200).json({ received: true, ignored: "invalid_reference" });
   }
 
-  const result = await settlePayment(reference, { requireUserId: null });
+  // The signature was verified above, so this is signed Paystack evidence.
+  const result = await settleAndRecord(reference, { requireUserId: null, source: "webhook", signedWebhook: true });
   switch (result.outcome) {
     case "created":
       return res.status(200).json({ received: true, orderId: result.orderId });
@@ -3145,6 +3274,211 @@ app.delete("/api/admin/coupons/:id", requireAdmin, async (req, res) => {
     res.status(500).json({ error: "Could not delete the coupon." });
   } finally {
     connection.release();
+  }
+});
+
+// ---------- Admin: payment issues (Payment Reliability Stage B) ----------
+// Reads and resolves payment_issues (migration 009 — PROPOSED, not applied anywhere
+// yet; until it is, these routes answer 500 and settlement is unaffected).
+// Every route is requireAdmin. Errors follow the admin convention — 400 malformed,
+// 404 unknown id, 409 well formed but refused — and never 403, which admin-core.js
+// treats as an expired session.
+// Nothing here creates an order or marks a payment paid: "Retry settlement" runs the
+// normal settlePayment() path, which re-verifies with Paystack server-to-server.
+const PAYMENT_ISSUE_COLUMNS = `pi.id, pi.payment_reference, pi.evidence, pi.category, pi.last_error_code,
+  pi.first_source, pi.last_source, pi.status, pi.resolution, pi.user_id, pi.order_id, pi.amount_pesewas,
+  pi.currency, pi.expected_total_pesewas, pi.detail_product_id, pi.attempt_count, pi.first_seen_at,
+  pi.last_seen_at, pi.resolved_by, pi.resolved_at`;
+
+// Per-process guards: a retry and a manual resolution of the SAME issue never run at
+// the same time in this process (409 RETRY_IN_PROGRESS / RESOLVE_IN_PROGRESS), and a
+// retry can't be double-submitted. They are NOT shared between server instances and
+// cannot see a webhook or callback settlement that is committing elsewhere. What
+// prevents a duplicate order is settlement's own idempotency (UNIQUE payment_reference
+// + transaction); what keeps a late order visible after a manual resolution is
+// resolveSettled() linking it and manual_resolution_conflict below.
+const paymentIssueRetries = new Set();
+const paymentIssueResolves = new Set();
+
+function shapePaymentIssue(r) {
+  const n = v => (v === null || v === undefined ? null : Number(v));
+  const hasOrder = r.linked_order_id !== null && r.linked_order_id !== undefined;
+  return {
+    id: r.id, payment_reference: r.payment_reference, evidence: r.evidence, category: r.category,
+    last_error_code: r.last_error_code, first_source: r.first_source, last_source: r.last_source,
+    status: r.status, resolution: r.resolution,
+    user_id: n(r.user_id), customer_name: r.customer_name || null,
+    order_id: n(r.order_id), linked_order_id: n(r.linked_order_id),
+    has_order: hasOrder,
+    // Closed by a manual decision, yet an order exists for the same payment (e.g. a
+    // settlement committed while or just after the decision was recorded). The
+    // recorded decision is kept as-is; admins must review it. Nothing about money is
+    // implied — this flag says only that both facts are true.
+    manual_resolution_conflict: r.status === "resolved" && !!r.resolution && r.resolution !== "settled" && hasOrder,
+    amount_pesewas: n(r.amount_pesewas), currency: r.currency, expected_total_pesewas: n(r.expected_total_pesewas),
+    detail_product_id: n(r.detail_product_id), attempt_count: Number(r.attempt_count) || 0,
+    first_seen_at: r.first_seen_at, last_seen_at: r.last_seen_at,
+    resolved_by: n(r.resolved_by), resolved_at: r.resolved_at,
+    retry_allowed: paymentIssues.isRetryable(r),
+  };
+}
+
+async function loadPaymentIssue(id) {
+  const [rows] = await pool.query(
+    `SELECT ${PAYMENT_ISSUE_COLUMNS}, pi.resolution_note,
+            u.full_name AS customer_name, rb.full_name AS resolved_by_name, p.name AS detail_product_name,
+            o.id AS linked_order_id, o.status AS linked_order_status, o.total AS linked_order_total
+       FROM payment_issues pi
+       LEFT JOIN users u ON u.id = pi.user_id
+       LEFT JOIN users rb ON rb.id = pi.resolved_by
+       LEFT JOIN products p ON p.id = pi.detail_product_id
+       LEFT JOIN orders o ON o.payment_reference = pi.payment_reference
+      WHERE pi.id = ?`, [id]);
+  if (!rows.length) return null;
+  const r = rows[0];
+  return {
+    ...shapePaymentIssue(r),
+    resolution_note: r.resolution_note || null,
+    resolved_by_name: r.resolved_by_name || null,
+    detail_product_name: r.detail_product_name || null,
+    linked_order: r.linked_order_id ? { id: Number(r.linked_order_id), status: r.linked_order_status, total: Number(r.linked_order_total) } : null,
+  };
+}
+
+app.get("/api/admin/payment-issues", requireAdmin, async (req, res) => {
+  const f = paymentIssues.parseListQuery(req.query);
+  if (f.error) return res.status(400).json({ error: f.error, field: f.field });
+  try {
+    const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total FROM payment_issues pi ${f.where}`, f.params);
+    const [rows] = await pool.query(
+      `SELECT ${PAYMENT_ISSUE_COLUMNS}, u.full_name AS customer_name, o.id AS linked_order_id
+         FROM payment_issues pi
+         LEFT JOIN users u ON u.id = pi.user_id
+         LEFT JOIN orders o ON o.payment_reference = pi.payment_reference
+         ${f.where}
+        ORDER BY pi.last_seen_at DESC, pi.id DESC
+        LIMIT ? OFFSET ?`, [...f.params, f.pageSize, (f.page - 1) * f.pageSize]);
+    const [counts] = await pool.query("SELECT status, COUNT(*) AS n FROM payment_issues GROUP BY status");
+    const count = s => Number((counts.find(c => c.status === s) || {}).n || 0);
+    res.json({
+      issues: rows.map(shapePaymentIssue), total: Number(total), page: f.page, pageSize: f.pageSize,
+      status_counts: { open: count("open"), resolved: count("resolved") },
+    });
+  } catch (err) {
+    console.error("payment issues list failed:", err.code || err.message);
+    res.status(500).json({ error: "Could not load payment issues." });
+  }
+});
+
+app.get("/api/admin/payment-issues/:id", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  try {
+    const issue = await loadPaymentIssue(id);
+    if (!issue) return res.status(404).json({ error: "Payment issue not found." });
+    res.json(issue);
+  } catch (err) {
+    console.error("payment issue detail failed:", err.code || err.message);
+    res.status(500).json({ error: "Could not load the payment issue." });
+  }
+});
+
+app.post("/api/admin/payment-issues/:id/retry", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  let row;
+  try {
+    const [rows] = await pool.query("SELECT id, payment_reference, status, category, last_error_code FROM payment_issues WHERE id = ?", [id]);
+    row = rows[0];
+  } catch (err) {
+    console.error("payment issue retry lookup failed:", err.code || err.message);
+    return res.status(500).json({ error: "Could not load the payment issue." });
+  }
+  if (!row) return res.status(404).json({ error: "Payment issue not found." });
+  if (row.status !== "open") return res.status(409).json({ error: "This issue is already resolved.", code: "ALREADY_RESOLVED" });
+  if (row.category === "integrity_mismatch") {
+    return res.status(409).json({ error: "Integrity mismatches can't be retried — the payment didn't match its order. Investigate it in Paystack and record a manual decision.", code: "RETRY_NOT_ALLOWED" });
+  }
+  if (!paymentIssues.isRetryable(row)) {
+    return res.status(409).json({ error: "This issue can't be settled automatically (the delivery address chosen at checkout was deleted). Contact the customer and record a manual decision.", code: "RETRY_NOT_ALLOWED" });
+  }
+  // Defence in depth: only a reference in the shape this server generates is ever
+  // passed to settlement, even though rows are only written by the server itself.
+  if (!PAYMENT_REFERENCE_PATTERN.test(row.payment_reference)) {
+    return res.status(409).json({ error: "This issue's payment reference is not valid.", code: "RETRY_NOT_ALLOWED" });
+  }
+  if (paymentIssueRetries.has(id)) {
+    return res.status(409).json({ error: "A retry for this issue is already in progress.", code: "RETRY_IN_PROGRESS" });
+  }
+  if (paymentIssueResolves.has(id)) {
+    return res.status(409).json({ error: "This issue is being resolved right now. Reload it in a moment.", code: "RESOLVE_IN_PROGRESS" });
+  }
+  paymentIssueRetries.add(id);
+  let result;
+  try {
+    result = await settleAndRecord(row.payment_reference, { requireUserId: null, source: "admin_retry", resolvedBy: req.user.id });
+  } finally {
+    paymentIssueRetries.delete(id);
+  }
+  console.warn(`Payment issue ${id} retried by admin id ${req.user.id}: ${result.outcome}${result.code ? ` ${result.code}` : ""}.`);
+  if (result.outcome === "unavailable") {
+    return res.status(503).json({ error: "Payments are not configured on this server.", code: "PAYMENTS_NOT_CONFIGURED" });
+  }
+  const settled = result.outcome === "created" || result.outcome === "already_processed";
+  let issue = null;
+  try { issue = await loadPaymentIssue(id); } catch (err) { console.error("payment issue reload failed:", err.code || err.message); }
+  res.json({
+    settled,
+    outcome: result.outcome,
+    code: result.code || null,
+    order_id: settled ? result.orderId : null,
+    message: paymentIssues.adminRetryMessage(result),
+    issue,
+  });
+});
+
+/* Manual resolution. One conditional UPDATE does the work: it only touches an OPEN
+   issue that has NO order with the same payment reference, so "already resolved" and
+   "an order exists" cannot slip in between a check and the write at the application
+   level.
+   Residual race (not eliminated, by design of this narrow fix): the NOT EXISTS
+   subquery sees committed orders only, so a webhook/callback settlement — or a retry
+   in ANOTHER server process — that commits its order a moment after this UPDATE is
+   not seen. In this process, a running retry of the same issue is refused below. If
+   an order does commit afterwards, resolveSettled() links it to this resolved issue
+   without changing the recorded decision, and the admin API/UI flag the
+   contradiction (manual_resolution_conflict). Exact isolation behaviour is still to
+   be validated on MariaDB and TiDB staging. */
+app.post("/api/admin/payment-issues/:id/resolve", requireAdmin, async (req, res) => {
+  const id = positiveIdParam(req, res); if (!id) return;
+  const v = paymentIssues.validateResolution(req.body);
+  if (v.error) return res.status(400).json({ error: v.error, field: v.field });
+  if (paymentIssueRetries.has(id)) {
+    return res.status(409).json({ error: "A retry for this issue is in progress. Wait for it to finish, then review the issue again.", code: "RETRY_IN_PROGRESS" });
+  }
+  if (paymentIssueResolves.has(id)) {
+    return res.status(409).json({ error: "This issue is already being resolved. Reload it in a moment.", code: "RESOLVE_IN_PROGRESS" });
+  }
+  paymentIssueResolves.add(id);
+  try {
+    const [result] = await pool.query(
+      `UPDATE payment_issues pi
+          SET pi.status = 'resolved', pi.resolution = ?, pi.resolution_note = ?, pi.resolved_by = ?, pi.resolved_at = CURRENT_TIMESTAMP
+        WHERE pi.id = ? AND pi.status = 'open'
+          AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.payment_reference = pi.payment_reference)`,
+      [v.values.resolution, v.values.note, req.user.id, id]);
+    if (result.affectedRows !== 1) {
+      const issue = await loadPaymentIssue(id);
+      if (!issue) return res.status(404).json({ error: "Payment issue not found." });
+      if (issue.status !== "open") return res.status(409).json({ error: "This issue is already resolved.", code: "ALREADY_RESOLVED" });
+      if (issue.has_order) return res.status(409).json({ error: "An order already exists for this payment. Use Retry settlement to link it, or handle the order itself.", code: "ORDER_EXISTS" });
+      return res.status(409).json({ error: "The issue changed while you were resolving it. Reload and try again.", code: "ISSUE_CHANGED" });
+    }
+    console.warn(`Payment issue ${id} resolved as ${v.values.resolution} by admin id ${req.user.id}.`);
+    res.json({ success: true, issue: await loadPaymentIssue(id) });
+  } catch (err) {
+    console.error("payment issue resolve failed:", err.code || err.message);
+    res.status(500).json({ error: "Could not resolve the payment issue." });
+  } finally {
+    paymentIssueResolves.delete(id);
   }
 });
 

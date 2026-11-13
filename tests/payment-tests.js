@@ -1,7 +1,16 @@
-// Local payment-integrity tests. Run from neofragrances-server:
-//   node <this file>
-// Starts a mock Paystack (5099) and the real server.js (5055) against the LOCAL db,
-// creates temporary fixtures, runs the tests, then removes every fixture and restores stock.
+// Local payment-integrity tests. Starts a mock Paystack (5099) and the real server.js (5055)
+// against an ISOLATED db, creates temporary fixtures, runs the tests, then removes every
+// fixture and restores stock.
+//
+// Runs ONLY under the isolated-database guard (tests/support/isolated-db-guard.js), against a
+// dedicated nf_test_* database — never the working database. Same launch pattern as
+// admin-api-tests.js (all on one line; the local DB account is given explicitly because the
+// guard blocks .env):
+//   NF_TEST_MODE=isolated NF_TEST_DB_NAME=nf_test_<name> NF_TEST_DB_SERVER_HOSTNAME=<@@hostname>
+//   DB_NAME=nf_test_<name> DB_HOST=127.0.0.1 DB_PORT=3308 DB_USER=<local account> DB_PASSWORD=
+//   NODE_OPTIONS=--require="<backend>/tests/support/isolated-db-guard-preload.js"
+//   node tests/payment-tests.js
+// The spawned server.js gets CHILD_ENV below: process.env plus the test overrides.
 const path = require("path");
 const http = require("http");
 const { spawn } = require("child_process");
@@ -9,17 +18,58 @@ const crypto = require("crypto");
 // This file lives in <repo>/tests, so default to the repo root above it: the suite then
 // runs as `node tests/<file>` with nothing set. An explicit SERVER_DIR still wins.
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
+// Isolation is checked BEFORE dotenv and db.js load: without the guard nothing reads .env
+// and no pool is ever created. (A preload with an invalid configuration has already exited.)
+{
+  const g = globalThis.__NF_ISOLATED_DB_GUARD__;
+  const e = process.env;
+  const problems = [];
+  if (!g) problems.push("the isolated-database guard preload is not active (NODE_OPTIONS --require=\"<backend>/tests/support/isolated-db-guard-preload.js\")");
+  if (e.NF_TEST_MODE !== "isolated") problems.push("NF_TEST_MODE must be \"isolated\"");
+  if (!e.NF_TEST_DB_NAME || e.DB_NAME !== e.NF_TEST_DB_NAME) problems.push("DB_NAME must equal NF_TEST_DB_NAME");
+  if (e.DB_NAME === "neofragrances") problems.push("DB_NAME must not be the working database");
+  if (g && g.db !== e.NF_TEST_DB_NAME) problems.push("the guard's database is not NF_TEST_DB_NAME");
+  if (e.DB_HOST !== "127.0.0.1") problems.push("DB_HOST must be 127.0.0.1");
+  if (String(e.DB_PORT) !== "3308") problems.push("DB_PORT must be 3308");
+  if (problems.length) { console.error("Refusing to run payment-tests.js:\n  - " + problems.join("\n  - ")); process.exit(1); }
+}
+const TEST_SECRET = crypto.randomBytes(32).toString("hex");
+const MOCK_PORT = 5099, API_PORT = 5055;
+const API = `http://127.0.0.1:${API_PORT}`;
+// Option 2B (as in admin-api-tests.js): the spawned server.js must load the guard too, or it
+// would read .env and connect unguarded. Build the child's environment once, here, and check
+// THAT object before any database access or spawn: its NODE_OPTIONS must --require, by
+// absolute path, the preload of the repo the child runs from (its cwd), and its isolation
+// settings must still validate. Every outside service is pinned to a local or empty value:
+// Paystack goes to the mock below, email sending and Google sign-in are unconfigured.
+const CHILD_ENV = {
+  ...process.env, PORT: API_PORT, JWT_SECRET: TEST_SECRET, PAYMENT_SIGNING_SECRET: "",
+  PAYSTACK_SECRET_KEY: "sk_test_mock", PAYSTACK_API_BASE: `http://127.0.0.1:${MOCK_PORT}`,
+  FRONTEND_URL: "http://127.0.0.1:5500", SENDGRID_API_KEY: "", GOOGLE_CLIENT_ID: "",
+};
+{
+  const preload = path.resolve(process.cwd(), "tests", "support", "isolated-db-guard-preload.js");
+  const samePath = (a, b) => (process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b);
+  // NODE_OPTIONS is whitespace-separated; double quotes keep a value with spaces together.
+  const tokens = (String(CHILD_ENV.NODE_OPTIONS || "").match(/(?:[^\s"]+|"[^"]*")+/g) || []).map(t => t.replace(/"/g, ""));
+  const required = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const m = /^(?:--require=(.+)|--require|-r)$/.exec(tokens[i]);
+    if (m) required.push(m[1] !== undefined ? m[1] : tokens[++i] || "");
+  }
+  const problems = [];
+  if (!required.some(p => path.isAbsolute(p) && samePath(path.resolve(p), preload))) {
+    problems.push(`the child's NODE_OPTIONS does not --require the guard preload by absolute path (expected ${preload}; NODE_OPTIONS ${CHILD_ENV.NODE_OPTIONS ? "is set without it" : "is not set"})`);
+  }
+  const childConfig = require(path.join(process.cwd(), "tests", "support", "isolated-db-guard")).validateTestConfig(CHILD_ENV);
+  if (!childConfig.ok) problems.push(`the child's isolation settings are invalid: ${childConfig.reason}`);
+  if (problems.length) { console.error("Refusing to run payment-tests.js (the child server would not be guarded):\n  - " + problems.join("\n  - ")); process.exit(1); }
+}
 require(path.join(process.cwd(), "node_modules/dotenv")).config({ quiet: true });
 const jwt = require(path.join(process.cwd(), "node_modules/jsonwebtoken"));
 const pool = require(path.join(process.cwd(), "db"));
 
-if (!["localhost", "127.0.0.1"].includes(process.env.DB_HOST) || process.env.DB_NAME !== "neofragrances") {
-  console.error("Refusing to run: not the local database."); process.exit(1);
-}
-
-const TEST_SECRET = crypto.randomBytes(32).toString("hex");
-const MOCK_PORT = 5099, API_PORT = 5055;
-const API = `http://127.0.0.1:${API_PORT}`;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ---------------- mock Paystack ---------------- */
 const txs = new Map();
@@ -57,6 +107,20 @@ const call = async (method, url, { token, body } = {}) => {
 const q = async (sql, p) => (await pool.query(sql, p))[0];
 const stockOf = async id => (await q("SELECT stock_qty FROM products WHERE id=?", [id]))[0].stock_qty;
 
+// Stops THIS suite's spawned server.js — the ChildProcess object only, never a pid or port
+// lookup, so no other process can be touched. Bounded: waits at most timeoutMs for the exit,
+// then reports instead of hanging. Returns null when the child is gone (or never spawned),
+// otherwise a short description of what went wrong.
+async function stopServer(child, timeoutMs = 5000) {
+  if (!child || child.pid === undefined) return null;                       // never spawned
+  const gone = () => child.exitCode !== null || child.signalCode !== null;
+  if (gone()) return null;
+  const exited = new Promise(resolve => child.once("exit", () => resolve(true)));
+  try { child.kill(); } catch (e) { return `kill failed (${(e && (e.code || e.message)) || e})`; }
+  const ok = await Promise.race([exited, sleep(timeoutMs).then(() => false)]);
+  return ok || gone() ? null : `did not exit within ${timeoutMs} ms`;
+}
+
 /* Fixture stock ceiling. The over-stock assertions below deliberately ask for a
    quantity a few units ABOVE the product's stock. That quantity must still fall within
    pricing.js's MAX_QTY_PER_LINE, otherwise the server rejects it as an invalid
@@ -70,9 +134,69 @@ const OVER_STOCK_PROBE = 3;                                    // this suite onl
 const MAX_FIXTURE_STOCK = MAX_QTY_PER_LINE - OVER_STOCK_PROBE; // 47
 
 (async () => {
+  // The guard's identity gate (gatePool → pool.__nfIdentityGate): SELECT DATABASE(), @@hostname,
+  // @@port must match before ANY query runs. Invoked explicitly so the order is visible and a
+  // failure stops here, before the server starts and before any fixture.
+  let identity = null;
+  try { identity = typeof pool.__nfIdentityGate === "function" ? await pool.__nfIdentityGate() : null; } catch (e) { identity = null; }
+  if (typeof identity !== "string" || !identity.startsWith(`${process.env.NF_TEST_DB_NAME}@`)) {
+    console.error("Refusing to run payment-tests.js: the database identity check did not pass.");
+    await pool.end().catch(() => {});
+    process.exit(1);
+  }
+  console.log(`database identity verified: ${identity}`);
+
   const fx = { users: [], addresses: [], coupons: [], offers: [], stock: new Map() };
   let server;
+  let mockListening = false;
   try {
+    /* ---------- servers: started and confirmed BEFORE any fixture is written ---------- */
+    // A port conflict or any other listen error rejects here, so the API server is never
+    // spawned and no fixture is written; the finally block then skips closing the mock.
+    await new Promise((resolve, reject) => {
+      const onError = e => reject(new Error(`mock Paystack could not listen on port ${MOCK_PORT} (${(e && (e.code || e.message)) || e}); the API server was not started and no fixtures were written`));
+      mock.once("error", onError);
+      mock.listen(MOCK_PORT, () => { mock.off("error", onError); mockListening = true; resolve(); });
+    });
+    server = spawn(process.execPath, ["server.js"], { env: CHILD_ENV, stdio: ["ignore", "pipe", "pipe"] });
+    let serverLog = ""; server.stdout.on("data", d => serverLog += d); server.stderr.on("data", d => serverLog += d);
+    // Readiness (as in admin-api-tests.js): wait passively, with no requests, for the child's
+    // own listening line, printed from server.js's app.listen callback — bounded by a hard
+    // 60 s deadline. A guard abort, spawn error, early exit or timeout throws, so it can never
+    // fall through to the fixtures or assertions below (the finally block still cleans up).
+    const STARTUP_DEADLINE_MS = 60000;
+    const startupAt = Date.now();
+    const listeningLine = `NeoFragrances API running at http://localhost:${API_PORT}`;
+    const guardAbort = /\[isolated-db-guard pid \d+\] ABORT:/;
+    let spawnError = null;
+    server.once("error", e => { spawnError = e; });
+    const childGone = () => server.exitCode !== null || server.signalCode !== null;
+    while (!serverLog.includes(listeningLine) && !guardAbort.test(serverLog) && !spawnError && !childGone() && Date.now() - startupAt < STARTUP_DEADLINE_MS) await sleep(100);
+    const startupFailure = (reason, extra = "") => new Error(
+      `child server not ready (${reason}) after ${Date.now() - startupAt} ms; no fixtures were written and no API requests were sent\n` +
+      `pid=${server.pid} exitCode=${server.exitCode} signal=${server.signalCode}${spawnError ? ` spawnError=${spawnError.code || spawnError.message}` : ""}${extra}\n` +
+      `last child output:\n${serverLog.split(/\r?\n/).filter(l => l.trim()).slice(-10).join("\n") || "(none)"}`);
+    if (guardAbort.test(serverLog)) throw startupFailure("isolated-db-guard violation");
+    if (spawnError) throw startupFailure("spawn error");
+    if (childGone()) throw startupFailure("child exited during startup");
+    if (!serverLog.includes(listeningLine)) throw startupFailure(`no listening signal within ${STARTUP_DEADLINE_MS} ms`);
+    // The child must pass its OWN identity check before any request that can change data:
+    // exactly ONE /api/health runs SELECT 1 through the child's guarded pool, which triggers
+    // its gate; the child's preload then prints "identity verified <db>@<host>:<port>".
+    // Bounded: AbortSignal.timeout (as server.js uses for Paystack). A timeout is not retried;
+    // it leaves health without a 200, so the check below throws and the finally block cleans up.
+    const HEALTH_TIMEOUT_MS = 15000;
+    let health;
+    try { const res = await fetch(API + "/api/health", { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) }); health = { status: res.status, body: await res.text() }; }
+    catch (e) { health = { error: e && (e.name === "TimeoutError" || e.name === "AbortError") ? `timeout after ${HEALTH_TIMEOUT_MS} ms` : (e && e.cause && e.cause.code) || (e && e.message) || "unknown" }; }
+    const childMarker = `identity verified ${process.env.NF_TEST_DB_NAME}@${process.env.NF_TEST_DB_SERVER_HOSTNAME}:${process.env.DB_PORT}`;
+    for (let i = 0; i < 50 && !serverLog.includes(childMarker) && !guardAbort.test(serverLog) && !childGone(); i++) await sleep(100);
+    if (guardAbort.test(serverLog)) throw startupFailure("isolated-db-guard violation during identity check");
+    if (!health || health.status !== 200 || !serverLog.includes(childMarker) || childGone()) {
+      throw startupFailure("database identity not confirmed", `\nhealth=${JSON.stringify(health)} expected="${childMarker}"`);
+    }
+    console.log(`child server ready after ${Date.now() - startupAt} ms; database identity verified (${childMarker.replace("identity verified ", "")})`);
+
     /* ---------- fixtures ---------- */
     const inStock = await q(
       "SELECT id, name, price, stock_qty FROM products WHERE deleted_at IS NULL AND stock_qty BETWEEN 5 AND ? ORDER BY id LIMIT 3",
@@ -106,12 +230,6 @@ const MAX_FIXTURE_STOCK = MAX_QTY_PER_LINE - OVER_STOCK_PROBE; // 47
     const oDisabled = await mkOffer(B.id, 1, "NOW() - INTERVAL 1 HOUR", "NOW() + INTERVAL 1 DAY", 0);
     const t1 = jwt.sign({ id: u1, role: "customer" }, TEST_SECRET), t2 = jwt.sign({ id: u2, role: "customer" }, TEST_SECRET);
     const pes = v => Math.round(Number(v) * 100);
-
-    /* ---------- servers ---------- */
-    await new Promise(r => mock.listen(MOCK_PORT, r));
-    server = spawn(process.execPath, ["server.js"], { env: { ...process.env, PORT: API_PORT, JWT_SECRET: TEST_SECRET, PAYMENT_SIGNING_SECRET: "", PAYSTACK_SECRET_KEY: "sk_test_mock", PAYSTACK_API_BASE: `http://127.0.0.1:${MOCK_PORT}`, FRONTEND_URL: "http://127.0.0.1:5500", SENDGRID_API_KEY: "" }, stdio: ["ignore", "pipe", "pipe"] });
-    let serverLog = ""; server.stdout.on("data", d => serverLog += d); server.stderr.on("data", d => serverLog += d);
-    for (let i = 0; i < 60; i++) { try { await fetch(API + "/"); break; } catch (e) { await new Promise(r => setTimeout(r, 200)); } }
 
     console.log(`fixtures: A=#${A.id} ${A.name} GH₵${A.price} (stock ${A.stock_qty}), B=#${B.id} GH₵${B.price}, sold-out=#${soldOut?.id}, live offer sale GH₵${saleA}`);
 
@@ -150,11 +268,23 @@ const MAX_FIXTURE_STOCK = MAX_QTY_PER_LINE - OVER_STOCK_PROBE; // 47
     check("initialize: requires login", r.status === 401);
     r = await call("POST", "/api/payments/initialize", { token: t1, body: { items: [{ productId: A.id, qty: 1 }], addressId: addr2 } });
     check("initialize: another customer's address rejected", r.status === 400 && r.data.code === "INVALID_ADDRESS");
+    // A delivery address is required: missing, null and "" are refused before Paystack is called.
+    for (const [label, extra] of [["missing", {}], ["null", { addressId: null }], ["empty string", { addressId: "" }]]) {
+      const initsBefore = txs.size, lastBefore = lastInit;
+      r = await call("POST", "/api/payments/initialize", { token: t1, body: { items: [{ productId: A.id, qty: 1 }], ...extra } });
+      check(`initialize: ${label} address rejected (ADDRESS_REQUIRED, Paystack not called)`, r.status === 400 && r.data.code === "ADDRESS_REQUIRED" && txs.size === initsBefore && lastInit === lastBefore, `${r.status} ${r.data?.code}`);
+    }
+    for (const [label, addressId] of [["non-numeric", "abc"], ["non-existent", 2147483000]]) {
+      const initsBefore = txs.size;
+      r = await call("POST", "/api/payments/initialize", { token: t1, body: { items: [{ productId: A.id, qty: 1 }], addressId } });
+      check(`initialize: ${label} address rejected (INVALID_ADDRESS, Paystack not called)`, r.status === 400 && r.data.code === "INVALID_ADDRESS" && txs.size === initsBefore, `${r.status} ${r.data?.code}`);
+    }
     r = await call("POST", "/api/payments/initialize", { token: t1, body: { items: [{ productId: A.id, qty: 2, offerId: oLive, price: 0.01 }, { productId: B.id, qty: 1 }], addressId: addr1, couponId: cPct, total: 1 } });
     const expectedSub = pes(saleA) * 2 + pes(B.price), expectedDisc = Math.round(expectedSub * 0.1), expectedTotal = expectedSub - expectedDisc + 800;
     check("initialize: Paystack charged the server-calculated amount (pesewas)", r.status === 200 && lastInit.amount === expectedTotal && Number.isInteger(lastInit.amount), `charged ${lastInit?.amount} expected ${expectedTotal}`);
     check("initialize: currency GHS + signed metadata", lastInit.currency === "GHS" && typeof lastInit.metadata.nf_order === "string" && /^[a-f0-9]{64}$/.test(lastInit.metadata.nf_sig));
     check("initialize: no price data trusted from client", !JSON.parse(lastInit.metadata.nf_order).lines.some(l => l.unitPrice === 1));
+    check("initialize: signed snapshot carries the customer's address", JSON.parse(lastInit.metadata.nf_order).addressId === addr1);
     const ref1 = r.data.reference;
     check("initialize: reference format", /^NF-\d+-\d+-[a-f0-9]{8}$/.test(ref1), ref1);
 
@@ -178,7 +308,7 @@ const MAX_FIXTURE_STOCK = MAX_QTY_PER_LINE - OVER_STOCK_PROBE; // 47
     check("verify: replay returns the same order", r.status === 200 && r.data.alreadyProcessed && r.data.orderId === orders1[0].id);
 
     // Tampering / mismatch cases (fresh payments).
-    const freshPayment = async (items) => (await call("POST", "/api/payments/initialize", { token: t1, body: { items } })).data.reference;
+    const freshPayment = async (items) => (await call("POST", "/api/payments/initialize", { token: t1, body: { items, addressId: addr1 } })).data.reference;
     let ref = await freshPayment([{ productId: C.id, qty: 1 }]);
     overrides.set(ref, { amount: txs.get(ref).amount - 100 });
     r = await call("GET", `/api/payments/verify/${ref}`, { token: t1 });
@@ -386,25 +516,64 @@ const MAX_FIXTURE_STOCK = MAX_QTY_PER_LINE - OVER_STOCK_PROBE; // 47
     results.push({ name: "harness", ok: false });
   } finally {
     /* ---------- cleanup: remove every fixture, restore stock ---------- */
-    try {
-      if (fx.users.length) {
+    // Every step is isolated: a failure is recorded and the next step still runs, so each
+    // recorded stock value is restored even if a deletion fails. Any recorded failure is
+    // printed at the end and makes the run exit 1. Only this run's own ids/references are used.
+    const cleanupFailures = [];
+    const step = async (label, fn) => {
+      try { await fn(); } catch (e) { cleanupFailures.push(`${label}: ${(e && (e.code || e.message)) || e}`); }
+    };
+
+    // Stop the API server first, so no settlement can still be writing (or holding row
+    // locks) while the fixtures are deleted.
+    await step("stop API server", async () => { const problem = await stopServer(server); if (problem) throw new Error(problem); });
+
+    await step("payment_issues (Stage B)", async () => {
+      // Stage B (migration 009, proposed): settlement may record payment_issues rows for
+      // this run's payments. Delete exactly those — the references this run initialized,
+      // as recorded by the mock Paystack (txs) — and only when the table exists, so the
+      // cleanup is identical on a pre-009 database. Done first: its foreign keys are
+      // ON DELETE SET NULL, so removing orders/users first would only null the links
+      // and leave the rows behind.
+      const fixtureRefs = [...txs.keys()];
+      if (fixtureRefs.length) {
+        const [{ n: hasIssues }] = await q("SELECT COUNT(*) AS n FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'payment_issues'");
+        if (Number(hasIssues) > 0) await q("DELETE FROM payment_issues WHERE payment_reference IN (?)", [fixtureRefs]);
+      }
+    });
+    if (fx.users.length) {
+      await step("orders + order_items", async () => {
         const orderIds = (await q("SELECT id FROM orders WHERE user_id IN (?)", [fx.users])).map(o => o.id);
         if (orderIds.length) { await q("DELETE FROM order_items WHERE order_id IN (?)", [orderIds]); await q("DELETE FROM orders WHERE id IN (?)", [orderIds]); }
-        await q("DELETE FROM addresses WHERE user_id IN (?)", [fx.users]);
-        await q("DELETE FROM users WHERE id IN (?)", [fx.users]);
-      }
-      if (fx.offers.length) { await q("DELETE FROM offer_products WHERE offer_id IN (?)", [fx.offers]); await q("DELETE FROM offers WHERE id IN (?)", [fx.offers]); }
-      if (fx.coupons.length) await q("DELETE FROM coupons WHERE id IN (?)", [fx.coupons]);
-      for (const [id, qty] of fx.stock) await q("UPDATE products SET stock_qty=? WHERE id=?", [qty, id]);
+      });
+      await step("addresses", () => q("DELETE FROM addresses WHERE user_id IN (?)", [fx.users]));
+      await step("users", () => q("DELETE FROM users WHERE id IN (?)", [fx.users]));
+    }
+    if (fx.offers.length) {
+      await step("offer_products", () => q("DELETE FROM offer_products WHERE offer_id IN (?)", [fx.offers]));
+      await step("offers", () => q("DELETE FROM offers WHERE id IN (?)", [fx.offers]));
+    }
+    if (fx.coupons.length) await step("coupons", () => q("DELETE FROM coupons WHERE id IN (?)", [fx.coupons]));
+    for (const [id, qty] of fx.stock) await step(`restore stock of product #${id}`, () => q("UPDATE products SET stock_qty=? WHERE id=?", [qty, id]));
+    await step("verify cleanup", async () => {
       const left = (await q("SELECT (SELECT COUNT(*) FROM users) u, (SELECT COUNT(*) FROM orders) o, (SELECT COUNT(*) FROM coupons) c, (SELECT COUNT(*) FROM offers) f, (SELECT COUNT(*) FROM addresses) a"))[0];
       const stockOk = (await Promise.all([...fx.stock].map(async ([id, qty]) => (await stockOf(id)) === qty))).every(Boolean);
       console.log(`cleanup: users=${left.u} orders=${left.o} coupons=${left.c} offers=${left.f} addresses=${left.a} | stock restored: ${stockOk}`);
-    } catch (e) { console.error("CLEANUP ERROR:", e.message); }
-    if (server) server.kill();
-    mock.close();
-    await pool.end();
+      if (!stockOk) throw new Error("at least one product's stock does not match its recorded value");
+    });
+
+    // Close the mock only if it actually started; drop lingering connections so close() cannot wait.
+    if (mockListening) await step("close mock Paystack", () => { if (typeof mock.closeAllConnections === "function") mock.closeAllConnections(); mock.close(); });
+    // Always attempt to close the pool; a rejection is recorded, never thrown past this point.
+    await step("close database pool", () => pool.end());
+
     const failed = results.filter(r => !r.ok).length;
     console.log(`\n${results.length - failed}/${results.length} passed${failed ? ` — ${failed} FAILED` : ""}`);
-    process.exit(failed ? 1 : 0);
+    if (cleanupFailures.length) {
+      console.error(`CLEANUP FAILED (${cleanupFailures.length} step${cleanupFailures.length === 1 ? "" : "s"}) — fixtures or stock may remain in ${process.env.NF_TEST_DB_NAME}:\n  - ${cleanupFailures.join("\n  - ")}`);
+    } else {
+      console.log("cleanup: all steps completed");
+    }
+    process.exit(failed || cleanupFailures.length ? 1 : 0);
   }
 })();

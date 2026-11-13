@@ -57,6 +57,8 @@ Object.assign(process.env, {
 // ---------- in-memory fake database ----------
 const USER_A = 990201, USER_B = 990202;
 const P1 = 990301, P2 = 990302;
+const ADDR_A = 990401, ADDR_B = 990402;   // delivery addresses of USER_A and USER_B
+const addresses = { [ADDR_A]: USER_A, [ADDR_B]: USER_B };
 let store = {
   products: { [P1]: { id: P1, name: "Reliability Test Scent", price: "100.00", stock_qty: 50, deleted_at: null },
               [P2]: { id: P2, name: "Reliability Sold Out", price: "100.00", stock_qty: 0, deleted_at: null } },
@@ -70,6 +72,10 @@ async function fakeQuery(sql, params = [], tx) {
   if (/FROM app_settings WHERE setting_key IN/.test(s)) return [[], []];
   if (s === "SELECT disabled_at, token_version FROM users WHERE id = ?") return [[{ disabled_at: null, token_version: 0 }], []];
   if (s === "SELECT email FROM users WHERE id = ?") return [[{ email: `rel-${params[0]}@example.invalid` }], []];
+  if (s === "SELECT id FROM addresses WHERE id = ? AND user_id = ?") {
+    const id = Number(params[0]);
+    return [addresses[id] === Number(params[1]) ? [{ id }] : [], []];
+  }
   if (s === "SELECT full_name, email FROM users WHERE id = ?") return [[{ full_name: "Reliability Test", email: `rel-${params[0]}@example.invalid` }], []];
   if (s === "SELECT id, name, price, stock_qty FROM products WHERE id IN (?) AND deleted_at IS NULL") {
     const ids = [].concat(params[0]).map(Number);
@@ -101,6 +107,17 @@ async function fakeQuery(sql, params = [], tx) {
     if (!tx || !tx.open) throw new Error("fake db: item insert outside a transaction");
     store.orderItems.push({ order_id: params[0], product_id: params[1], quantity: params[2], price_at_purchase: params[3] });
     return [{ insertId: store.orderItems.length, affectedRows: 1 }, []];
+  }
+  // PI-06: settlement asks why a stock update matched no row (archived vs sold out).
+  if (s === "SELECT deleted_at FROM products WHERE id = ?") {
+    const p = store.products[Number(params[0])];
+    return [p ? [{ deleted_at: p.deleted_at }] : [], []];
+  }
+  // Stage B: this suite simulates migration 009 NOT being applied. Every issue write
+  // fails as "table doesn't exist" — which must never change a payment response.
+  if (/\bpayment_issues\b/.test(s)) {
+    fake.issueTableMissing = (fake.issueTableMissing || 0) + 1;
+    throw Object.assign(new Error("Table 'payment_issues' doesn't exist"), { code: "ER_NO_SUCH_TABLE", errno: 1146 });
   }
   fake.unexpected.push(s);
   throw new Error("fake db: unexpected query");
@@ -204,11 +221,11 @@ async function webhook(event, { badSignature = false } = {}) {
 }
 const ordersFor = ref => store.orders.filter(o => o.payment_reference === ref);
 const stockOf = id => store.products[id].stock_qty;
-async function initialize() {
+async function initialize(extra = { addressId: ADDR_A }) {
   const res = await realFetch(`${BASE}/api/payments/initialize`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${tokenFor(USER_A)}` },
-    body: JSON.stringify({ items: [{ productId: P1, qty: 1 }] }),
+    body: JSON.stringify({ items: [{ productId: P1, qty: 1 }], ...extra }),
   });
   const text = await res.text(); let data = {}; try { data = JSON.parse(text); } catch (e) { /* not JSON */ }
   return { status: res.status, data };
@@ -370,6 +387,16 @@ async function backendTests() {
   r = await initialize();
   check("I3 initialize: network failure → 502 PAYSTACK_INIT_FAILED", r.status === 502 && r.data.code === "PAYSTACK_INIT_FAILED", { status: r.status, code: r.data.code });
   initMode = "ok";
+  for (const [label, extra] of [["missing", {}], ["null", { addressId: null }], ["empty string", { addressId: "" }]]) {
+    lastInitBody = null;
+    r = await initialize(extra);
+    check(`I4 initialize: ${label} delivery address → 400 ADDRESS_REQUIRED, Paystack never asked`, r.status === 400 && r.data.code === "ADDRESS_REQUIRED" && lastInitBody === null, { status: r.status, code: r.data.code });
+  }
+  lastInitBody = null;
+  r = await initialize({ addressId: ADDR_B });
+  check("I5 initialize: another customer's address → 400 INVALID_ADDRESS, Paystack never asked", r.status === 400 && r.data.code === "INVALID_ADDRESS" && lastInitBody === null, { status: r.status, code: r.data.code });
+  r = await initialize();
+  check("I6 initialize: own address → 200, signed snapshot carries it", r.status === 200 && lastInitBody && JSON.parse(lastInitBody.metadata.nf_order).addressId === ADDR_A, { status: r.status });
 
   // --- the timeout cases started at the top ---
   const [tv, tw, ti] = await timeoutCalls;
@@ -380,6 +407,7 @@ async function backendTests() {
 
   check("B1 every acquired GET_LOCK was matched by a RELEASE_LOCK", fake.getLocks > 0 && fake.getLocks === fake.releaseLocks, [fake.getLocks, fake.releaseLocks]);
   check("S1 no unexpected database statement", fake.unexpected.length === 0, fake.unexpected);
+  check("B2 with migration 009 absent, issue writes failed quietly and every payment response above was unaffected", (fake.issueTableMissing || 0) > 0, fake.issueTableMissing);
   check("S2 the server made no outbound request except to the local mock Paystack", net.refused.length === 0 && net.toMock > 0, { refused: net.refused, toMock: net.toMock });
   check("S3 no MX/DNS lookup", net.mx === 0);
 }
