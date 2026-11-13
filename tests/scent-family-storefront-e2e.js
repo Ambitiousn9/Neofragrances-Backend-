@@ -154,7 +154,11 @@ const imageSums = () => Object.fromEntries(fs.readdirSync(IMG_DIR).sort().map(f 
       hidden: s.hidden, cards: [...document.querySelectorAll("#scent-grid .nf-scent-card")].map(a=>({href:a.getAttribute("href"), h3:a.querySelector("h3")?.textContent, p:a.querySelector("p")?.textContent, alt:a.querySelector("img")?.getAttribute("alt"), src:a.querySelector("img")?.getAttribute("src"), text:a.innerText})),
       eyebrow: s.querySelector(".nf-eyebrow")?.innerText, h2: s.querySelector("h2")?.textContent, intro: s.querySelector(".nf-section-head p")?.textContent || null };})()`);
     const homeIntegrity = () => ev(`(()=>({
-      sections: [...document.querySelectorAll("section")].map(s=>s.id||s.className.split(" ").pop()),
+      // index.html's own sections only: layout.js replaces the #site-header / #site-footer
+      // placeholders with <header class="site-header"> / <footer class="site-footer"> (the footer
+      // has its own <section> since 2026-10-27), and the expected count below is read from
+      // index.html's source, which does not contain them.
+      sections: [...document.querySelectorAll("section")].filter(s=>!s.closest(".site-header, .site-footer")).map(s=>s.id||s.className.split(" ").pop()),
       heroTitle: document.getElementById("hero-title")?.textContent.trim(),
       heroStats: !document.getElementById("hero-stats").hidden && Number(document.getElementById("stat-products").textContent) > 0,
       brands: !document.getElementById("brands").hidden && document.querySelectorAll("#brands-track a").length > 0,
