@@ -1,17 +1,64 @@
-// Milestone 5 admin API tests against the real server.js (:5058, random JWT secret) and the LOCAL db.
+// Milestone 5 admin API tests against the real server.js (:5058, random JWT secret) and an ISOLATED db.
 // All fixtures (users, products, orders, reviews, offers) are removed and stock restored afterwards.
+//
+// ADMIN-5C: runs ONLY under the isolated-database guard (tests/support/isolated-db-guard.js),
+// against a dedicated nf_test_* database — never the working database. Example (all on one
+// line; the local DB account is supplied explicitly because the guard blocks .env):
+//   NF_TEST_MODE=isolated NF_TEST_DB_NAME=nf_test_<name> NF_TEST_DB_SERVER_HOSTNAME=<@@hostname>
+//   DB_NAME=nf_test_<name> DB_HOST=127.0.0.1 DB_PORT=3308 DB_USER=<local account> DB_PASSWORD=
+//   NODE_OPTIONS=--require="<backend>/tests/support/isolated-db-guard-preload.js"
+//   node tests/admin-api-tests.js
+// The spawned server.js inherits NODE_OPTIONS and DB_* through { ...process.env }.
 const path = require("path"), crypto = require("crypto");
 const { spawn } = require("child_process");
 // This file lives in <repo>/tests, so default to the repo root above it: the suite then
 // runs as `node tests/<file>` with nothing set. An explicit SERVER_DIR still wins.
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
+// Isolation is checked BEFORE dotenv and db.js load: without the guard nothing reads .env
+// and no pool is ever created. (A preload with an invalid configuration has already exited.)
+{
+  const g = globalThis.__NF_ISOLATED_DB_GUARD__;
+  const e = process.env;
+  const problems = [];
+  if (!g) problems.push("the isolated-database guard preload is not active (NODE_OPTIONS --require=\"<backend>/tests/support/isolated-db-guard-preload.js\")");
+  if (e.NF_TEST_MODE !== "isolated") problems.push("NF_TEST_MODE must be \"isolated\"");
+  if (!e.NF_TEST_DB_NAME || e.DB_NAME !== e.NF_TEST_DB_NAME) problems.push("DB_NAME must equal NF_TEST_DB_NAME");
+  if (g && g.db !== e.NF_TEST_DB_NAME) problems.push("the guard's database is not NF_TEST_DB_NAME");
+  if (e.DB_HOST !== "127.0.0.1") problems.push("DB_HOST must be 127.0.0.1");
+  if (String(e.DB_PORT) !== "3308") problems.push("DB_PORT must be 3308");
+  if (problems.length) { console.error("Refusing to run admin-api-tests.js:\n  - " + problems.join("\n  - ")); process.exit(1); }
+}
+const SECRET = crypto.randomBytes(32).toString("hex");
+const API = "http://127.0.0.1:5058";
+// ADMIN-5E-DIAG 2B: the spawned server.js must load the guard too, or it would read .env
+// and connect unguarded. Build the child's environment once, here, and check THAT object
+// before any database access or spawn: its NODE_OPTIONS must --require, by absolute path,
+// the preload of the repo the child runs from (its cwd, so the guard wraps the same
+// mysql2 that server.js loads), and its isolation settings must still validate.
+const CHILD_ENV = { ...process.env, PORT: 5058, JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true" };
+{
+  const preload = path.resolve(process.cwd(), "tests", "support", "isolated-db-guard-preload.js");
+  const samePath = (a, b) => (process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b);
+  // NODE_OPTIONS is whitespace-separated; double quotes keep a value with spaces together.
+  const tokens = (String(CHILD_ENV.NODE_OPTIONS || "").match(/(?:[^\s"]+|"[^"]*")+/g) || []).map(t => t.replace(/"/g, ""));
+  const required = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const m = /^(?:--require=(.+)|--require|-r)$/.exec(tokens[i]);
+    if (m) required.push(m[1] !== undefined ? m[1] : tokens[++i] || "");
+  }
+  const problems = [];
+  if (!required.some(p => path.isAbsolute(p) && samePath(path.resolve(p), preload))) {
+    problems.push(`the child's NODE_OPTIONS does not --require the guard preload by absolute path (expected ${preload}; NODE_OPTIONS ${CHILD_ENV.NODE_OPTIONS ? "is set without it" : "is not set"})`);
+  }
+  const childConfig = require(path.join(process.cwd(), "tests", "support", "isolated-db-guard")).validateTestConfig(CHILD_ENV);
+  if (!childConfig.ok) problems.push(`the child's isolation settings are invalid: ${childConfig.reason}`);
+  if (problems.length) { console.error("Refusing to run admin-api-tests.js (the child server would not be guarded):\n  - " + problems.join("\n  - ")); process.exit(1); }
+}
 require(path.join(process.cwd(), "node_modules/dotenv")).config({ quiet: true });
 const jwt = require(path.join(process.cwd(), "node_modules/jsonwebtoken"));
 const bcrypt = require(path.join(process.cwd(), "node_modules/bcrypt"));
 const pool = require(path.join(process.cwd(), "db"));
 if (!["localhost", "127.0.0.1"].includes(process.env.DB_HOST)) { console.error("not local"); process.exit(1); }
-const SECRET = crypto.randomBytes(32).toString("hex");
-const API = "http://127.0.0.1:5058";
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const q = async (s, p) => (await pool.query(s, p))[0];
 const results = []; const check = (n, c, x = "") => { results.push(!!c); console.log(`${c ? "PASS" : "FAIL"} ${n}${x !== "" ? "  [" + String(x).slice(0, 160) + "]" : ""}`); };
@@ -22,19 +69,67 @@ const call = async (method, url, token, body) => {
 };
 
 (async () => {
+  // The guard's identity gate (gatePool → pool.__nfIdentityGate): SELECT DATABASE(), @@hostname,
+  // @@port must match before ANY query runs. Invoked explicitly so the order is visible and a
+  // failure stops here, before the baseline read and before any fixture.
+  let identity = null;
+  try { identity = typeof pool.__nfIdentityGate === "function" ? await pool.__nfIdentityGate() : null; } catch (e) { identity = null; }
+  if (typeof identity !== "string" || !identity.startsWith(`${process.env.NF_TEST_DB_NAME}@`)) {
+    console.error("Refusing to run admin-api-tests.js: the database identity check did not pass.");
+    await pool.end().catch(() => {});
+    process.exit(1);
+  }
+  console.log(`database identity verified: ${identity}`);
+
   const stamp = Date.now(); const userIds = [], productIds = [], orderIds = [], offerIds = [], couponIds = [];
   let server;
   const baseline = (await q("SELECT (SELECT COUNT(*) FROM users) u,(SELECT COUNT(*) FROM products) p,(SELECT COUNT(*) FROM orders) o,(SELECT COUNT(*) FROM reviews) r,(SELECT COUNT(*) FROM offers) f,(SELECT COUNT(*) FROM offer_products) fp,(SELECT COUNT(*) FROM coupons) c,(SELECT SUM(stock_qty) FROM products) s"))[0];
   try {
     const hash = await bcrypt.hash("Secret123", 10);
-    const mkUser = async (name, role) => { const id = (await q("INSERT INTO users (full_name, email, phone, password_hash, role, email_verified_at, auth_provider) VALUES (?, ?, '0200000000', ?, ?, NOW(), 'local')", [name, `nf-adm-${name.toLowerCase()}-${stamp}@gmail.com`, hash, role])).insertId; userIds.push(id); return id; };
+    const mkUser = async (name, role) => { const id = (await q("INSERT INTO users (full_name, email, phone, password_hash, role, email_verified_at, auth_provider) VALUES (?, ?, '0200000000', ?, ?, NOW(), 'local')", [name, `nf-adm-${name.toLowerCase()}-${stamp}@example.invalid`, hash, role])).insertId; userIds.push(id); return id; };
     const ADMIN = await mkUser("Ada", "admin"), CUST = await mkUser("Kofi", "customer"), CUST2 = await mkUser("Esi", "customer");
     const tok = id => jwt.sign({ id, role: id === ADMIN ? "admin" : "customer" }, SECRET);
     const tA = tok(ADMIN), tC = tok(CUST);
     const forged = jwt.sign({ id: CUST, role: "admin" }, SECRET); // customer with a token claiming admin
 
-    server = spawn(process.execPath, ["server.js"], { env: { ...process.env, PORT: 5058, JWT_SECRET: SECRET, DEV_EMAIL_LOG: "true" }, stdio: "ignore" });
-    for (let i = 0; i < 60; i++) { try { await fetch(API + "/"); break; } catch (e) { await sleep(200); } }
+    server = spawn(process.execPath, ["server.js"], { env: CHILD_ENV, stdio: ["ignore", "pipe", "pipe"] });
+    let serverLog = "";
+    server.stdout.on("data", d => { serverLog += d; });
+    server.stderr.on("data", d => { serverLog += d; });
+    // ADMIN-5E: startup is not fast on every machine — Stage 3 measured ~17 s spent loading
+    // express / jsonwebtoken / google-auth-library before listen(). So instead of a fixed ~12 s
+    // probe loop, wait (passively, no requests) for the child's own listening line, which
+    // server.js prints from its app.listen callback once the socket is bound — bounded by a
+    // hard 60 s deadline. Any guard abort, spawn error, early exit or timeout fails closed.
+    const STARTUP_DEADLINE_MS = 60000;
+    const startupAt = Date.now();
+    const listeningLine = "NeoFragrances API running at http://localhost:5058";
+    const guardAbort = /\[isolated-db-guard pid \d+\] ABORT:/;
+    let spawnError = null;
+    server.once("error", e => { spawnError = e; });
+    const childGone = () => server.exitCode !== null || server.signalCode !== null;
+    while (!serverLog.includes(listeningLine) && !guardAbort.test(serverLog) && !spawnError && !childGone() && Date.now() - startupAt < STARTUP_DEADLINE_MS) await sleep(100);
+    const startupFailure = (reason, extra = "") => new Error(
+      `child server not ready (${reason}) after ${Date.now() - startupAt} ms; no API requests were sent\n` +
+      `pid=${server.pid} exitCode=${server.exitCode} signal=${server.signalCode}${spawnError ? ` spawnError=${spawnError.code || spawnError.message}` : ""}${extra}\n` +
+      `last child output:\n${serverLog.split(/\r?\n/).filter(l => l.trim()).slice(-10).join("\n") || "(none)"}`);
+    if (guardAbort.test(serverLog)) throw startupFailure("isolated-db-guard violation");
+    if (spawnError) throw startupFailure("spawn error");
+    if (childGone()) throw startupFailure("child exited during startup");
+    if (!serverLog.includes(listeningLine)) throw startupFailure(`no listening signal within ${STARTUP_DEADLINE_MS} ms`);
+    // The child must pass its OWN identity check before any API request that can change
+    // data: exactly ONE /api/health runs SELECT 1 through the child's guarded pool, which
+    // triggers its gate; the child's preload then prints "identity verified <db>@<host>:<port>".
+    let health;
+    try { const res = await fetch(API + "/api/health"); health = { status: res.status, body: await res.text() }; }
+    catch (e) { health = { error: (e && e.cause && e.cause.code) || (e && e.message) || "unknown" }; }
+    const childMarker = `identity verified ${process.env.NF_TEST_DB_NAME}@${process.env.NF_TEST_DB_SERVER_HOSTNAME}:${process.env.DB_PORT}`;
+    for (let i = 0; i < 50 && !serverLog.includes(childMarker) && !guardAbort.test(serverLog) && !childGone(); i++) await sleep(100);
+    if (guardAbort.test(serverLog)) throw startupFailure("isolated-db-guard violation during identity check");
+    if (!health || health.status !== 200 || !serverLog.includes(childMarker) || childGone()) {
+      throw startupFailure("database identity not confirmed", `\nhealth=${JSON.stringify(health)} expected="${childMarker}"`);
+    }
+    console.log(`child server ready after ${Date.now() - startupAt} ms; database identity verified (${childMarker.replace("identity verified ", "")})`);
 
     /* ---------- access control on every admin route ---------- */
     const routes = [["GET", "/api/admin/summary"], ["GET", "/api/admin/reports"], ["GET", "/api/admin/products"], ["POST", "/api/admin/products"], ["PUT", "/api/admin/products/1"], ["DELETE", "/api/admin/products/1"], ["PATCH", "/api/admin/products/1/restore"], ["PATCH", "/api/admin/products/1/stock"], ["GET", "/api/admin/orders"], ["GET", "/api/admin/orders/1"], ["PATCH", "/api/admin/orders/1/status"], ["GET", "/api/admin/customers"], ["GET", "/api/admin/customers/1"], ["GET", "/api/admin/reviews"], ["PATCH", "/api/admin/reviews/1/hidden"], ["DELETE", "/api/admin/reviews/1"], ["GET", "/api/admin/offers"], ["POST", "/api/admin/offers"], ["PUT", "/api/admin/offers/1"], ["PATCH", "/api/admin/offers/1/toggle"], ["PATCH", "/api/admin/offers/1/featured"], ["DELETE", "/api/admin/offers/1"], ["GET", "/api/admin/coupons"], ["POST", "/api/admin/coupons"], ["GET", "/api/admin/coupons/1"], ["PUT", "/api/admin/coupons/1"], ["PATCH", "/api/admin/coupons/1/active"], ["DELETE", "/api/admin/coupons/1"]];
