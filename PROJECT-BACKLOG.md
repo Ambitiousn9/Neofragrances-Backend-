@@ -964,14 +964,34 @@ Dependencies & risks / Next action.
 - Dependencies & risks: blocks all of Phase 7.
 - Next action: owner decision.
 
-**P6.7 — Stale code comments** · *NOT STARTED*
+**P6.7 — Stale code comments** · *COMPLETE (Local)*
 - Required: comments match reality.
-- Exists: `server.js:3369` and `payment-issues.js:2` say migration 009 is "PROPOSED, not applied anywhere",
-  but it was applied locally on 2026-10-17.
-- Remains: correct them.
-- Evidence: grep (2026-11-14).
+- Exists: three comments described migration 009 (`payment_issues`) as "PROPOSED, not applied anywhere"
+  or "proposed". They now state its real status: **applied LOCAL ONLY on 2026-10-17; NOT applied to production;
+  there is no staging yet; not verified on TiDB**, and they point to the Status header in
+  `migrations/009_payment_issues.sql`:
+  - `server.js`, the payment-issues admin routes header (now lines 3394–3397; the audit cited 3369 before later
+    edits moved it). It keeps the accurate warning that, wherever 009 is not applied, these routes answer 500 and
+    settlement is unaffected; the code confirms this, since every route catches errors and answers 500, and
+    `settleAndRecord` catches failed issue writes;
+  - `payment-issues.js`, the file header (lines 2–4);
+  - `tests/payment-tests.js`, the payment_issues cleanup step (line 532): "proposed" became "applied LOCAL ONLY;
+    not in production".
+  - Kept unchanged because they are conditional and still true for production: `server.js:858` (admin badge),
+    `server.js:2720` (best-effort issue write) and the frontend's `js/admin-core.js:111`, plus the test
+    comments that deliberately simulate a missing 009 table.
+- Remains: nothing for P6.7. Migration 009 itself is still outstanding in production (section 5; TiDB check P5.2).
+- Evidence:
+  - backend commit `ff5a9f4`, pushed to `rebuild` `feature/neofragrances-project-baseline` (2026-11-14);
+  - comment-only: every changed line is a `//` comment, and each file's code is identical to the previous
+    commit once comment lines are ignored. No executable code, SQL, migration, configuration, `.env` or
+    database content changed;
+  - `node --check` passes on `server.js`, `payment-issues.js` and `tests/payment-tests.js`;
+    payment-issues-tests 84/84 and payment-reliability-tests 79/79; a plain `payment-tests.js` run is still
+    refused by the isolated-database guard. No database was started;
+  - the status wording matches the migration's own Status header, the section 5 ledger and `tests/README.md`.
 - Dependencies & risks: none.
-- Next action: small fix (needs approval).
+- Next action: none. Update these comments again when 009 is applied to staging or production.
 
 ### Phase 7 — Staging deployment
 *Objective: the rebuild runs on real hosting, against a real (non-production) database, before launch.*
@@ -1203,7 +1223,7 @@ stale — P2.4).
    - the product-details `???` notes bug (P3.4);
    - ~~email normalisation, G-8 (P1.11)~~ — **done 2026-11-14** (`43e3427`, `406d9a1`);
    - ~~the password minimum, G-9 (P1.12)~~ — **done 2026-11-14**, minimum 8 (`dfc6ccd`, `d60f0ef`);
-   - stale 009 comments (P6.7).
+   - ~~stale 009 comments (P6.7)~~ — **done 2026-11-14** (`ff5a9f4`).
 3. **Fragrance Education integration (P3.1):** nav, footer, drawer and product-page links, plus the maceration
    section once the copy is approved.
 4. **Dark mode (P3.3):** design decision, then a token-mapping plan for storefront and admin together, then implementation.
