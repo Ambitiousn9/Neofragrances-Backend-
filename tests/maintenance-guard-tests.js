@@ -6,6 +6,8 @@
 // past maintenance — payment initialization included. This suite proves that every
 // spelling of a blocked route is refused while maintenance is on, that every bypass
 // still answers in any casing, and that nothing changes while maintenance is off.
+// R3: HEAD /api/health is bypassed too (monitors that probe with HEAD), and HEAD on any
+// other route stays blocked.
 //
 // DATABASE-FREE BY CONSTRUCTION, same method as security-headers-tests.js: ./db is
 // replaced in the require cache by an in-memory fake pool before server.js loads. The
@@ -155,6 +157,13 @@ const bodyFor = m => (m === "GET" ? undefined : {});
     check("G11 an uppercase admin path is still protected by requireAdmin (401, not served)", r.status === 401, r.status);
     r = await call("POST", "/Api/Admin/Maintenance", { maintenance: false, progress: 0, message: "" });
     check("G12 the admin maintenance save in another casing still needs an admin (401)", r.status === 401, r.status);
+
+    // R3: monitors that probe with HEAD see the real health status; HEAD gains nothing elsewhere.
+    const head = async p => { const res = await realFetch(BASE + p, { method: "HEAD" }); return { p, status: res.status, retryAfter: res.headers.get("retry-after") }; };
+    const hh = [await head("/api/health"), await head("/API/HEALTH")];
+    check("G12a HEAD /api/health answers 200 during maintenance, in any casing, with no maintenance Retry-After", hh.every(x => x.status === 200 && x.retryAfter === null), hh);
+    const hb = [await head("/api/products"), await head("/API/offers/active"), await head("/api/me"), await head("/api/system/status"), await head("/api/payments/verify/nf-1234567890-1-abcd")];
+    check("G12b HEAD on every other route is still refused with the maintenance 503 (only the health check gains HEAD)", hb.every(x => x.status === 503 && x.retryAfter === "600"), hb);
 
     // ---------- maintenance OFF again ----------
     maintenanceOn = false; settings.invalidateMaintenanceCache();

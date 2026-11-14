@@ -104,6 +104,9 @@ app.use(express.json({
                                    Blocking it is an unrecoverable lockout.
      GET  /api/health              Render's health check. A 503 here reads as
                                    "service down" and can trigger a restart.
+     HEAD /api/health              the same check for monitors that probe with
+                                   HEAD (Express answers it with the GET handler,
+                                   headers only), so they see the real status too.
      GET  /api/me                  admin-core.js awaits this during boot; on
                                    failure its ready promise never resolves and
                                    EVERY admin page stays dead. GET only —
@@ -128,6 +131,7 @@ const MAINTENANCE_BYPASS_PREFIXES = ["/api/admin/"];
 const MAINTENANCE_BYPASS_EXACT = new Set([
   "POST /api/login",
   "GET /api/health",
+  "HEAD /api/health",
   "GET /api/me",
   "POST " + PAYMENT_WEBHOOK_PATH,
   "GET /api/system/status",
