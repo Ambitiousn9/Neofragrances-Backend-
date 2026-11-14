@@ -73,6 +73,19 @@ app.use(cors({
   },
 }));
 
+// Where Paystack sends the customer back after paying (QA-001). The page that started the
+// checkout is the right place to return to: a phone on the LAN must come back to the LAN
+// address it is using, not to FRONTEND_URL's 127.0.0.1, which on the phone is the phone itself.
+// The request's Origin is used only when it is EXACTLY one of the allowed origins above (the
+// same set CORS uses, so production allows only CORS_ORIGINS and FRONTEND_URL). Anything else,
+// including no Origin at all, gets FRONTEND_URL exactly as before. Host, Referer and
+// X-Forwarded-* are never consulted, so no request can steer the redirect elsewhere.
+function paymentCallbackUrl(req) {
+  const origin = req.get("Origin");
+  const base = origin && ALLOWED_ORIGINS.has(stripSlash(origin)) ? stripSlash(origin) : process.env.FRONTEND_URL;
+  return `${base}/payment-callback.html`;
+}
+
 const PAYMENT_WEBHOOK_PATH = "/api/payments/webhook";
 
 // Paystack signs the exact bytes it sends, so the webhook needs the body as received:
@@ -2453,7 +2466,7 @@ app.post("/api/payments/initialize", requireAuth, async (req, res) => {
           amount: pricing.total,              // integer pesewas, calculated by the server
           currency: pricing.currency,
           reference,
-          callback_url: `${process.env.FRONTEND_URL}/payment-callback.html`,
+          callback_url: paymentCallbackUrl(req),
           metadata: { nf_order: payload, nf_sig: sig },
         }),
         signal: AbortSignal.timeout(PAYSTACK_INIT_TIMEOUT_MS),

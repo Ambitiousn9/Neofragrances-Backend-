@@ -45,13 +45,18 @@ function check(name, ok, detail) {
 
 // ---------- environment: set BEFORE server.js loads ----------
 const JWT_SECRET = crypto.randomBytes(32).toString("hex");
+const LAN_ORIGIN = "http://172.20.10.3:5500";
+const PROD_ORIGIN = "https://nf-production-standin.netlify.app";
 Object.assign(process.env, {
   PORT: String(PORT),
   DB_HOST: "127.0.0.1", DB_PORT: "1", DB_NAME: "nf-payment-reliability-no-db",
   JWT_SECRET, PAYMENT_SIGNING_SECRET: crypto.randomBytes(32).toString("hex"),
   PAYSTACK_SECRET_KEY: FAKE_PAYSTACK_KEY, PAYSTACK_API_BASE: MOCK_BASE,
   SENDGRID_API_KEY: "", SENDGRID_FROM_EMAIL: "", GOOGLE_CLIENT_ID: "",
-  DEV_EMAIL_LOG: "true", NODE_ENV: "", CORS_ORIGINS: "", FRONTEND_URL: "http://127.0.0.1:5500",
+  DEV_EMAIL_LOG: "true", NODE_ENV: "", FRONTEND_URL: "http://127.0.0.1:5500",
+  // QA-001: the iPhone LAN origin and a stand-in for the production Netlify origin (the real value
+  // lives only in Render), so the callback-URL checks CB1-CB8 can tell allowed from unapproved origins.
+  CORS_ORIGINS: `${LAN_ORIGIN},${PROD_ORIGIN}`,
 });
 
 // ---------- in-memory fake database ----------
@@ -221,10 +226,10 @@ async function webhook(event, { badSignature = false } = {}) {
 }
 const ordersFor = ref => store.orders.filter(o => o.payment_reference === ref);
 const stockOf = id => store.products[id].stock_qty;
-async function initialize(extra = { addressId: ADDR_A }) {
+async function initialize(extra = { addressId: ADDR_A }, headers = {}) {
   const res = await realFetch(`${BASE}/api/payments/initialize`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${tokenFor(USER_A)}` },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${tokenFor(USER_A)}`, ...headers },
     body: JSON.stringify({ items: [{ productId: P1, qty: 1 }], ...extra }),
   });
   const text = await res.text(); let data = {}; try { data = JSON.parse(text); } catch (e) { /* not JSON */ }
@@ -397,6 +402,32 @@ async function backendTests() {
   check("I5 initialize: another customer's address → 400 INVALID_ADDRESS, Paystack never asked", r.status === 400 && r.data.code === "INVALID_ADDRESS" && lastInitBody === null, { status: r.status, code: r.data.code });
   r = await initialize();
   check("I6 initialize: own address → 200, signed snapshot carries it", r.status === 200 && lastInitBody && JSON.parse(lastInitBody.metadata.nf_order).addressId === ADDR_A, { status: r.status });
+
+  // --- QA-001: where Paystack sends the customer back (callback_url sent to Paystack) ---
+  const callbackFor = async headers => { lastInitBody = null; const x = await initialize(undefined, headers); return { status: x.status, cb: lastInitBody && lastInitBody.callback_url }; };
+  let c = await callbackFor({ Origin: "http://127.0.0.1:5500" });
+  check("CB1 laptop origin 127.0.0.1:5500 → callback http://127.0.0.1:5500/payment-callback.html", c.status === 200 && c.cb === "http://127.0.0.1:5500/payment-callback.html", c);
+  c = await callbackFor({ Origin: LAN_ORIGIN });
+  check("CB2 iPhone LAN origin (allowed via CORS_ORIGINS) → callback returns to the LAN address, not 127.0.0.1", c.status === 200 && c.cb === `${LAN_ORIGIN}/payment-callback.html`, c);
+  c = await callbackFor({ Origin: PROD_ORIGIN });
+  check("CB3 production-style frontend origin (allowed via CORS_ORIGINS) → callback on that origin", c.status === 200 && c.cb === `${PROD_ORIGIN}/payment-callback.html`, c);
+  const unapproved = ["https://evil.example", "http://172.20.10.3:5501", "http://172.20.10.3:5500.evil.example", "https://evil.example/172.20.10.3:5500", "null", "http://172.20.10.4:5500"];
+  const leaked = [];
+  for (const o of unapproved) { const x = await callbackFor({ Origin: o }); if (x.cb !== "http://127.0.0.1:5500/payment-callback.html") leaked.push(`${o} -> ${x.cb}`); }
+  check(`CB4 ${unapproved.length} unapproved or look-alike origins fall back to FRONTEND_URL (never used as the callback)`, leaked.length === 0, leaked);
+  c = await callbackFor({});
+  check("CB5 no Origin header → FRONTEND_URL, exactly as before", c.status === 200 && c.cb === "http://127.0.0.1:5500/payment-callback.html", c);
+  c = await callbackFor({ "X-Forwarded-Host": "evil.example", "X-Forwarded-Proto": "https", Referer: "https://evil.example/cart.html" });
+  check("CB6 forwarded-host, forwarded-proto and Referer headers are ignored (no Origin → FRONTEND_URL)", c.status === 200 && c.cb === "http://127.0.0.1:5500/payment-callback.html", c);
+  c = await callbackFor({ Origin: `${LAN_ORIGIN}/` });
+  check("CB7 the path is always exactly /payment-callback.html (a trailing slash never doubles it)", c.cb === `${LAN_ORIGIN}/payment-callback.html`, c);
+  // Production composition: the helper must use the CORS allowlist itself (which drops the dev
+  // origins in production) and read no header but Origin.
+  const serverSrc = require("fs").readFileSync(path.join(SERVER, "server.js"), "utf8");
+  const helper = serverSrc.slice(serverSrc.indexOf("function paymentCallbackUrl("), serverSrc.indexOf("\n}\n", serverSrc.indexOf("function paymentCallbackUrl(")));
+  check("CB8 the callback helper uses the same ALLOWED_ORIGINS set as CORS, falls back to FRONTEND_URL, and reads no Host/Referer/forwarded header; initialize uses it",
+    /ALLOWED_ORIGINS\.has\(stripSlash\(origin\)\)/.test(helper) && /process\.env\.FRONTEND_URL/.test(helper) && !/host|referer|forwarded/i.test(helper.replace(/^\s*\/\/.*$/gm, ""))
+    && /callback_url: paymentCallbackUrl\(req\),/.test(serverSrc) && !/callback_url: `\$\{process\.env\.FRONTEND_URL\}/.test(serverSrc));
 
   // --- the timeout cases started at the top ---
   const [tv, tw, ti] = await timeoutCalls;
