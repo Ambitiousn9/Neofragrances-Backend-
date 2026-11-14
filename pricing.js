@@ -24,6 +24,9 @@ class PricingError extends Error {
 
 const toPesewas = value => Math.round(Number(value) * 100);
 const toCedis = pesewas => Math.round(pesewas) / 100;
+// True when n has at most 2 decimal places. n * 100 is compared with a small tolerance
+// because floats can't hold most 2-dp values exactly (289.15 * 100 === 28914.999999999996).
+const hasAtMost2dp = n => Number.isFinite(n) && Math.abs(n * 100 - Math.round(n * 100)) < 1e-6;
 
 function isPositiveInt(v) {
   if (typeof v === "boolean" || v === null || v === undefined || v === "") return false;
@@ -213,5 +216,5 @@ function quoteForClient(pricing) {
 
 module.exports = {
   CURRENCY, SHIPPING_FLAT_PESEWAS, PricingError,
-  toPesewas, toCedis, priceCart, signSnapshot, readSignedSnapshot, quoteForClient,
+  toPesewas, toCedis, hasAtMost2dp, priceCart, signSnapshot, readSignedSnapshot, quoteForClient,
 };

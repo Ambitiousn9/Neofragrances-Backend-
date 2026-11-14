@@ -23,7 +23,7 @@ const crypto = require("crypto");
 const { OAuth2Client } = require("google-auth-library");
 const dns = require("dns").promises;
 const pool = require("./db");
-const { CURRENCY, PricingError, toCedis, priceCart, signSnapshot, readSignedSnapshot, quoteForClient } = require("./pricing");
+const { CURRENCY, PricingError, toCedis, hasAtMost2dp, priceCart, signSnapshot, readSignedSnapshot, quoteForClient } = require("./pricing");
 const maintenanceSettings = require("./settings");
 const accounts = require("./accounts");
 const { createRateLimiter, createLoginThrottle } = require("./rate-limit");
@@ -733,7 +733,7 @@ function validateProductBody(body) {
   if (!name || name.length > 150) return { field: "name", error: "Name is required (up to 150 characters)." };
   if (!brand || brand.length > 100) return { field: "brand", error: "Brand is required (up to 100 characters)." };
   if (!PRODUCT_CATEGORIES.includes(category)) return { field: "category", error: "Category must be men, women or unisex." };
-  if (body.price === "" || body.price === null || body.price === undefined || !Number.isFinite(price) || price <= 0 || price > 1000000 || Math.round(price * 100) !== price * 100) {
+  if (body.price === "" || body.price === null || body.price === undefined || !Number.isFinite(price) || price <= 0 || price > 1000000 || !hasAtMost2dp(price)) {
     return { field: "price", error: "Price must be more than 0 with at most 2 decimal places." };
   }
   if (badge.length > 20) return { field: "badge", error: "Badge must be 20 characters or fewer." };
@@ -2965,9 +2965,7 @@ async function validateOfferBody(body, existingProductIds = []) {
   const displayOrder = body.display_order === undefined || body.display_order === "" ? 0 : Number(body.display_order);
   const start = new Date(body.start_at), end = new Date(body.end_at);
   const num = v => (typeof v === "boolean" || v === null || v === "" ? NaN : Number(v));
-  // At most 2 decimal places. n * 100 is compared with a small tolerance because floats
-  // can't hold most 2-dp prices exactly (289.15 * 100 === 28914.999999999996).
-  const money2 = n => Number.isFinite(n) && n > 0 && n <= 1000000 && Math.abs(n * 100 - Math.round(n * 100)) < 1e-6;
+  const money2 = n => n > 0 && n <= 1000000 && hasAtMost2dp(n);
   if (!title || title.length > 150) return { field: "title", error: "Title is required (up to 150 characters)." };
   if (description.length > 2000) return { field: "description", error: "Description must be 2000 characters or fewer." };
   if (!OFFER_TYPES.includes(offerType)) return { field: "offer_type", error: "Invalid offer type." };
@@ -3203,7 +3201,7 @@ function validateCouponBody(body) {
   if (hasPercent && hasAmount) return { field: "discount_percent", error: "Choose either a percentage or a fixed amount, not both." };
   if (!hasPercent && !hasAmount) return { field: "discount_percent", error: "Enter either a percentage or a fixed amount." };
 
-  const dec2 = n => Number.isFinite(n) && Math.round(n * 100) === n * 100;
+  const dec2 = hasAtMost2dp;
   let percent = null, amount = null;
   if (hasPercent) {
     percent = Number(b.discount_percent);

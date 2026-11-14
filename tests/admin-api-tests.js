@@ -160,6 +160,12 @@ const call = async (method, url, token, body) => {
     let badOk = 0; const badFail = [];
     for (const [body, field] of bad) { const x = await call("POST", "/api/admin/products", tA, body); if (x.status === 400 && x.data.field === field) badOk++; else badFail.push(field + ":" + x.status); }
     check(`product validation rejects ${bad.length} bad inputs with the right field`, badOk === bad.length, badFail.join(","));
+    // T08: 2-dp prices whose x100 is not an exact float (289.15 * 100 === 28914.999999999996) are valid.
+    r = await call("POST", "/api/admin/products", tA, { ...good, name: `NF Test Price ${stamp}`, price: 289.15 }); if (r.data?.id) productIds.push(r.data.id);
+    check("price 289.15 is accepted and stored exactly", r.status === 201 && Number((await q("SELECT price FROM products WHERE id = ?", [r.data?.id || 0]))[0]?.price) === 289.15, JSON.stringify(r.data));
+    const PP = r.data?.id || 0;
+    r = await call("PUT", `/api/admin/products/${PP}`, tA, { ...good, stock_qty: undefined, name: `NF Test Price ${stamp}`, price: 1.15 });
+    check("edit to price 1.15 is accepted and stored exactly", r.status === 200 && Number((await q("SELECT price FROM products WHERE id = ?", [PP]))[0]?.price) === 1.15, JSON.stringify(r.data));
     r = await call("PUT", `/api/admin/products/${P1}`, tA, { ...good, stock_qty: undefined, price: 480, name: `NF Test Oud ${stamp} EDP` });
     const p1row = (await q("SELECT price, stock_qty, name FROM products WHERE id = ?", [P1]))[0];
     check("edit product without stock keeps stock (no reset)", r.status === 200 && Number(p1row.price) === 480 && p1row.stock_qty === 7, JSON.stringify(p1row));
@@ -405,6 +411,11 @@ const call = async (method, url, token, body) => {
     for (const [body, field] of badC) { const x = await call("POST", "/api/admin/coupons", tA, body); if (x.status === 400 && x.data.field === field) bcOk++; else bcFail.push(`${field}:${x.status}:${x.data && x.data.field}`); }
     check(`coupon validation rejects ${badC.length} bad inputs with the right field`, bcOk === badC.length, bcFail.join(","));
     check("no rows were created by the rejected inputs", (await q("SELECT COUNT(*) n FROM coupons WHERE code LIKE ?", [`%${stamp}%`]))[0].n === 1, (await q("SELECT COUNT(*) n FROM coupons WHERE code LIKE ?", [`%${stamp}%`]))[0].n);
+    // T08: 2-dp amounts and percentages whose x100 is not an exact float are valid.
+    r = await call("POST", "/api/admin/coupons", tA, { code: `NFAMT${stamp}`, discount_amount: 289.15 }); if (r.data?.id) couponIds.push(r.data.id);
+    check("coupon amount 289.15 is accepted and stored exactly", r.status === 201 && Number((await q("SELECT discount_amount FROM coupons WHERE id = ?", [r.data?.id || 0]))[0]?.discount_amount) === 289.15, JSON.stringify(r.data));
+    r = await call("POST", "/api/admin/coupons", tA, { code: `NFPCT${stamp}`, discount_percent: 4.35 }); if (r.data?.id) couponIds.push(r.data.id);
+    check("coupon percentage 4.35 is accepted and stored exactly", r.status === 201 && Number((await q("SELECT discount_percent FROM coupons WHERE id = ?", [r.data?.id || 0]))[0]?.discount_percent) === 4.35, JSON.stringify(r.data));
 
     r = await call("PUT", `/api/admin/coupons/${C1}`, tA, { code: cCode, discount_amount: 25, usage_limit: 3, active: true });
     const c1row = (await q("SELECT code, discount_percent, discount_amount, usage_limit, active FROM coupons WHERE id = ?", [C1]))[0];
