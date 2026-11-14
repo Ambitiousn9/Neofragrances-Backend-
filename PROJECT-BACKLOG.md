@@ -555,14 +555,32 @@ Dependencies & risks / Next action.
   - large surface for visual regressions.
 - Next action: owner design decision, then a token-mapping plan covering storefront and admin together.
 
-**P3.4 — Product-details page shows `???` notes** · *NOT STARTED*
+**P3.4 — Product-details page shows `???` notes** · *COMPLETE (Local)*
 - Required: placeholder notes are never shown as if they were real.
-- Exists: the notes check excludes only `—` (`product-details.html:116–117`), so the 15 products with `???` notes
-  render "built around ???" copy and `???` note cards.
-- Remains: treat `???` (and empty values) as missing.
-- Evidence: code; read-only `SELECT` (2026-11-14): 15 active products have `???` notes.
-- Dependencies & risks: none.
-- Next action: small fix (needs approval).
+- Exists:
+  - **cause:** the notes check excluded only `—`, so the 15 products with `???` notes rendered "built around ???"
+    copy and `???` note cards;
+  - **fix:** `pdRealNote()` in `product-details.html` counts a note as real only if it contains a letter or digit
+    and no `??` run; `notesComplete` requires it for all three notes. Products without real notes now show
+    "Fragrance notes haven't been added for this product yet." Products with real notes are unchanged;
+  - `_headers`: new CSP hash for the product page's inline script (`sha256-7zwMNHoK…`) in all 50 storefront rules.
+- Remains: nothing for P3.4. The generic generated description these products now fall back to is the separate
+  decision P3.5.
+- Evidence:
+  - frontend commit `670d75b`, pushed to `rebuild` `feature/neofragrances-project-baseline` (2026-11-14);
+  - tests: new `tests/product-details-notes-tests.js` 13/13 (the page's real lines in a vm sandbox: 16 placeholder,
+    empty or non-text values rejected, 10 real note texts accepted, whole-product cases, dependent markup). Mutation
+    runs (old dash-only check, dropping the `??` rule, accepting any text) each fail it;
+  - real-browser check under the real `_headers` CSP (scratch tool, canned API data, no database), 6/6: `???` and
+    `—` products show no note cards, no `???` and the "not added yet" message; a real-notes product shows its three
+    notes; no CSP violations or errors;
+  - other frontend suites green: storefront-security-headers 34/34, admin-security-headers 29/29,
+    maintenance-page 22/22, admin-maintenance 30/30, admin-logout 14/14, admin-payment-issues 30/30;
+  - read-only `SELECT` (2026-11-14): 15 active products have `???` notes, 145 `—`.
+- Dependencies & risks: the guarded backend browser suites that open product pages (`restore-app-verify`,
+  `scent-family-storefront-e2e`) were not re-run after this change (part of P2.2). Any later edit to the product
+  page's inline script needs a new CSP hash.
+- Next action: none for P3.4; include in the P2.2 full regression.
 
 **P3.5 — Generated product descriptions are not verified information** · *NOT STARTED*
 - Required: no invented product claims on the product page.
