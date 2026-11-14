@@ -54,7 +54,7 @@ const fakePool = {
     if (s === "SELECT * FROM products WHERE deleted_at IS NULL") return [[], []];
     if (/FROM offers JOIN offer_products ON offer_products\.offer_id = offers\.id/.test(s)) return [[], []];
     if (/FROM reviews JOIN users ON reviews\.user_id = users\.id WHERE reviews\.product_id = \?/.test(s)) return [[], []];
-    if (s === "SELECT * FROM users WHERE email = ?") return [[], []];
+    if (s === "SELECT * FROM users WHERE LOWER(email) = ?") return [[], []];
     if (s === "SELECT disabled_at, token_version FROM users WHERE id = ?") {
       return [Number(params[0]) === FAKE_USER.id ? [{ disabled_at: null, token_version: 0 }] : [], []];
     }

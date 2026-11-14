@@ -56,7 +56,7 @@ const fakePool = {
     }
     if (s === "SELECT * FROM products WHERE deleted_at IS NULL") return [[], []];
     if (/FROM offers JOIN offer_products ON offer_products\.offer_id = offers\.id/.test(s)) return [[], []];
-    if (s === "SELECT * FROM users WHERE email = ?") return [[], []];
+    if (s === "SELECT * FROM users WHERE LOWER(email) = ?") return [[], []];
     stats.unexpected.push(s); throw new Error("fake pool: unexpected query");
   },
   async getConnection() { stats.connections++; throw new Error("fake pool: connections refused"); },

@@ -326,6 +326,12 @@ function sendRateLimited(res, retryAfterSeconds) {
   return res.status(429).json({ error: RATE_LIMITED_MESSAGE, code: "RATE_LIMITED" });
 }
 
+// One canonical form for every email the API receives (G-8): surrounding spaces removed and
+// lower-cased; anything that is not text becomes "" and fails the usual "required" check.
+// Lookups compare LOWER(email), so accounts stored with capitals by older code still match
+// whatever the column's collation is (production TiDB's has not been verified).
+const normalizeEmail = v => (typeof v === "string" ? v.trim().toLowerCase() : "");
+
 // ---------- Register ----------
 app.post("/api/register", async (req, res) => {
   // Before anything else: every attempt that gets past this line counts, valid or not.
@@ -333,7 +339,8 @@ app.post("/api/register", async (req, res) => {
   if (registerLimiter.isLimited(registerKey)) return sendRateLimited(res, registerLimiter.retryAfterSeconds(registerKey));
   registerLimiter.record(registerKey);
 
-  const { fullName, email, phone, password } = req.body;
+  const { fullName, phone, password } = req.body;
+  const email = normalizeEmail(req.body.email);
 
   if (!fullName || !email || !password) {
     return res.status(400).json({ error: "Full name, email, and password are required." });
@@ -348,7 +355,7 @@ app.post("/api/register", async (req, res) => {
   }
 
   try {
-    const [existing] = await pool.query("SELECT id FROM users WHERE email = ?", [email]);
+    const [existing] = await pool.query("SELECT id FROM users WHERE LOWER(email) = ?", [email]);
     if (existing.length > 0) {
       return res.status(409).json({ error: "An account with this email already exists." });
     }
@@ -376,7 +383,8 @@ app.post("/api/register", async (req, res) => {
 
 // ---------- Login ----------
 app.post("/api/login", async (req, res) => {
-  const { email, password } = req.body;
+  const { password } = req.body;
+  const email = normalizeEmail(req.body.email);
 
   if (!email || !password) {
     return res.status(400).json({ error: "Email and password are required." });
@@ -388,7 +396,7 @@ app.post("/api/login", async (req, res) => {
   if (throttle.limited) return sendRateLimited(res, throttle.retryAfter);
 
   try {
-    const [rows] = await pool.query("SELECT * FROM users WHERE email = ?", [email]);
+    const [rows] = await pool.query("SELECT * FROM users WHERE LOWER(email) = ?", [email]);
     if (rows.length === 0) {
       loginThrottle.recordFailure(req.ip, email);
       return res.status(401).json({ error: "Invalid email or password." });
@@ -474,11 +482,11 @@ app.post("/api/auth/google", async (req, res) => {
       });
     }
 
-    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedEmail = normalizeEmail(email);
 
     // Check if this email already has a NeoFragrances account
     const [existingUsers] = await pool.query(
-      "SELECT * FROM users WHERE email = ?",
+      "SELECT * FROM users WHERE LOWER(email) = ?",
       [normalizedEmail]
     );
 
@@ -2092,7 +2100,7 @@ app.post("/api/resend-verification", async (req, res) => {
   }
   recordVerifyIpRequest(ip);
 
-  const email = (req.body?.email || "").trim();
+  const email = normalizeEmail(req.body?.email);
   if (!email) {
     return res.status(400).json({ error: "Email is required." });
   }
@@ -2104,7 +2112,7 @@ app.post("/api/resend-verification", async (req, res) => {
 
   try {
     const [users] = await pool.query(
-      "SELECT id, full_name, email_verified_at FROM users WHERE email = ?",
+      "SELECT id, full_name, email_verified_at FROM users WHERE LOWER(email) = ?",
       [email]
     );
     if (users.length === 0 || users[0].email_verified_at) {
@@ -2175,7 +2183,7 @@ app.post("/api/forgot-password", async (req, res) => {
   }
   recordIpRequest(ip);
 
-  const email = (req.body?.email || "").trim();
+  const email = normalizeEmail(req.body?.email);
   if (!email) {
     return res.status(400).json({ error: "Email is required." });
   }
@@ -2186,7 +2194,7 @@ app.post("/api/forgot-password", async (req, res) => {
   recordEmailCooldown(email);
 
   try {
-    const [users] = await pool.query("SELECT id, full_name, disabled_at FROM users WHERE email = ?", [email]);
+    const [users] = await pool.query("SELECT id, full_name, disabled_at FROM users WHERE LOWER(email) = ?", [email]);
     if (users.length === 0) {
       return res.json(GENERIC);
     }

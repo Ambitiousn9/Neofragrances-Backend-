@@ -63,7 +63,7 @@ const fakePool = {
     if (/^(INSERT|UPDATE|DELETE|REPLACE|ALTER|CREATE|DROP|TRUNCATE|RENAME|GRANT)\b/i.test(s)) {
       stats.writes.push(s); throw new Error("fake pool: write refused");
     }
-    if (s === "SELECT * FROM users WHERE email = ?") {
+    if (s === "SELECT * FROM users WHERE LOWER(email) = ?") {
       stats.userLookups++;
       const u = FAKE_USERS[params[0]];
       return [u ? [{ ...u }] : [], []];

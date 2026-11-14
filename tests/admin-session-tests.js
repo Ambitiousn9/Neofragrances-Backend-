@@ -68,7 +68,7 @@ const versions = () => Object.fromEntries(Object.values(users).map(u => [u.id, u
 const fake = { unexpected: [], writes: [], statusReads: 0, failCommitFor: null };
 async function fakeQuery(sql, params = [], tx) {
   const s = String(sql).replace(/\s+/g, " ").trim();
-  if (s === "SELECT * FROM users WHERE email = ?") { const u = byEmail(params[0]); return [u ? [{ ...u }] : [], []]; }
+  if (s === "SELECT * FROM users WHERE LOWER(email) = ?") { const u = byEmail(params[0]); return [u ? [{ ...u }] : [], []]; }
   if (s === "SELECT disabled_at, token_version FROM users WHERE id = ?") {
     if (!tx) fake.statusReads++;
     const u = users[Number(params[0])]; return [u ? [{ disabled_at: u.disabled_at, token_version: u.token_version }] : [], []];

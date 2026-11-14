@@ -81,7 +81,7 @@ async function fakeQuery(sql, params = [], tx) {
   const s = String(sql).replace(/\s+/g, " ").trim();
   const inTx = () => { if (!tx || !tx.open) throw new Error(`fake db: outside a transaction: ${s}`); };
   const user = () => users[Number(params[params.length - 1])];
-  if (s === "SELECT * FROM users WHERE email = ?") { const u = byEmail(params[0]); return [u ? [{ ...u }] : [], []]; }
+  if (s === "SELECT * FROM users WHERE LOWER(email) = ?") { const u = byEmail(params[0]); return [u ? [{ ...u }] : [], []]; }
   if (s === "SELECT disabled_at, token_version FROM users WHERE id = ?") {
     const u = user(); return [u ? [{ disabled_at: u.disabled_at, token_version: u.token_version }] : [], []];
   }
