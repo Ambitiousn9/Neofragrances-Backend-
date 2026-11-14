@@ -92,13 +92,42 @@ Dependencies & risks / Next action.
 - Next action: P0.3.
 
 **P0.3 — Off-machine copy of the database backups** · *NOT STARTED*
-- Required: a copy of the database backup folders somewhere other than this PC's only disk.
-- Exists: code is off-machine (GitHub). Database backups are not.
-- Remains: choose a destination; copy; verify hashes there.
-- Evidence: P0.2 folders all on `C:`.
-- Dependencies & risks: owner chooses the destination (see section 7). The backups include personal data
-  from the catalogue and customer tables, so the destination must be private.
-- Next action: owner decision, then copy with hash verification.
+- Required: a copy of the database backup folders somewhere other than this PC's only disk, verified by hash
+  at the destination.
+- Exists:
+  - code is off-machine (GitHub). Database backups are not;
+  - **the set to copy is current and verified (2026-11-14):**
+    - **fresh logical dump** `C:\Users\Ambitous\NeoFragrances-DB-Backups\dump-3308-20261114-131835\`, taken
+      read-only against the running 3308 with the same method as 0B-8 (one `mysqldump --single-transaction`
+      per database, Gate A options). 8 databases; each exit code 0, empty stderr, completion trailer present,
+      `CREATE TABLE` count equal to the live table count. `MANIFEST-sha256.txt` and `CHECKSUMS.txt` verify.
+      Compared with the 2026-11-13 dump: `neofragrances` changed only in users, email_verifications, addresses,
+      orders, order_items and products (the day's activity, including order #527); `nf_test_phase1_20261029`
+      changed only in 13 auto-increment counters; the other 6 databases are identical;
+    - **restore test: PASS** (13:58–14:03), into a fresh scratch MariaDB 10.4.32 on 127.0.0.1:3307 (new
+      `mysql_install_db` datadir, pinned launcher, identity gate first). 8/8 databases restored with their
+      original character sets (exit code 0, empty stderr). Re-dumps are **identical** to the dump files.
+      21 foreign keys per NeoFragrances database. Catalogue 169 / 166 active / stock 2611 / 32 scent families;
+      order #527 present. All `neofragrances` tables match live 3308 in row count and checksum. Clean shutdown;
+      dump set unchanged; frozen 3306 untouched. `RESTORE-TEST-RESULT.txt` is in the dump folder;
+  - **scope chosen by the owner:** backups only, about 246 MB plus the fresh dump: `NeoFragrances-DB-Backups`,
+    `NeoFragrances-Repo-Preservation`, `NeoFragrances-Server-Backups`, `NeoFragrances-Frontend-Backups`
+    (not the 1.4 GB `NeoFragrances-DB-Validation` evidence folder).
+- Remains: choose a destination; copy; verify every file's SHA-256 at the destination.
+- Evidence:
+  - drive check (2026-11-14): the only disk is the internal TOSHIBA MQ04ABF100 (`C:`, 931 GB, 201 GB free);
+    no removable or network drive attached. A OneDrive folder exists, but copying there uploads to a cloud service;
+    the owner chose to **wait** rather than use it;
+  - dump: `dump-3308-20261114-131835\DUMP-INFO.txt`, `MANIFEST-sha256.txt`;
+  - restore test: `C:\Users\Ambitous\NeoFragrances-DB-Validation\rt3307-20261114-135810\evidence\`
+    (run log, restore log, re-dump comparison, FK counts, scratch log; `EVIDENCE-SHA256.txt` verifies).
+    A first attempt (`rt3307-20261114-135346`) stopped at the empty default `test` database of the fresh
+    datadir and was shut down cleanly; it is kept and marked as superseded.
+- Dependencies & risks: owner chooses the destination (decision D7, section 7). The backups include personal
+  data and password hashes, so the destination must be private. Until copied, a single-disk failure loses every
+  backup (B2).
+- Next action: owner connects a private destination (e.g. a USB drive) and gives its drive letter; then copy the
+  chosen scope and verify every file by SHA-256 there.
 
 **P0.4 — Protect the frozen 3306 database** · *COMPLETE (Local)*
 - Required: the damaged XAMPP datadir on 3306 must never be started again.
