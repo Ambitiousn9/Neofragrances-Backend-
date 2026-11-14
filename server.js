@@ -332,6 +332,11 @@ function sendRateLimited(res, retryAfterSeconds) {
 // whatever the column's collation is (production TiDB's has not been verified).
 const normalizeEmail = v => (typeof v === "string" ? v.trim().toLowerCase() : "");
 
+// G-9 (2026-11-14): one minimum for every NEW password — registration, password reset
+// and password change. Login never checks it, so existing accounts whose passwords were
+// set under the old 6-character rule keep signing in.
+const MIN_PASSWORD_LENGTH = 8;
+
 // ---------- Register ----------
 app.post("/api/register", async (req, res) => {
   // Before anything else: every attempt that gets past this line counts, valid or not.
@@ -345,8 +350,8 @@ app.post("/api/register", async (req, res) => {
   if (!fullName || !email || !password) {
     return res.status(400).json({ error: "Full name, email, and password are required." });
   }
-  if (password.length < 6) {
-    return res.status(400).json({ error: "Password must be at least 6 characters." });
+  if (typeof password !== "string" || password.length < MIN_PASSWORD_LENGTH) {
+    return res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters.` });
   }
 
   const mailServerOk = await domainHasMailServer(email);
@@ -1744,7 +1749,6 @@ const passwordChangeLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max:
 const trackOrderLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10 });
 
 const PHONE_PATTERN = /^[+0-9\s-]{7,20}$/;
-const MIN_PASSWORD_LENGTH = 6; // same rule as registration and password reset
 
 function isPositiveId(value) {
   const n = Number(value);
@@ -2262,8 +2266,8 @@ app.post("/api/reset-password", async (req, res) => {
   if (typeof token !== "string" || typeof password !== "string" || !token || !password) {
     return res.status(400).json({ error: "Token and new password are required." });
   }
-  if (password.length < 6) {
-    return res.status(400).json({ error: "Password must be at least 6 characters." });
+  if (password.length < MIN_PASSWORD_LENGTH) {
+    return res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters.` });
   }
   if (password.length > 200) {
     return res.status(400).json({ error: "That password is too long." });

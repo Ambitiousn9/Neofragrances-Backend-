@@ -72,9 +72,16 @@ const results = []; const check = (n, c, x = "") => { results.push(!!c); console
     await ev(fill([["reg-email", `valid-${stamp}@gmail.com`]]));
     await submitRegister(); await sleep(500);
     const v1 = await regMsg();
-    check("14. short password rejected in the form (custom message)", /at least 6/i.test(v1) && !net.some(n => n.path === "/api/register"), v1);
+    check("14. short password rejected in the form (custom message)", /at least 8/i.test(v1) && !net.some(n => n.path === "/api/register"), v1);
     const apiShort = await (await fetch("http://127.0.0.1:5055/api/register", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ fullName: "X", email: `x${stamp}@gmail.com`, password: "123" }) })).json();
-    check("14b. short password rejected by the API", /at least 6/.test(apiShort.error), apiShort.error);
+    check("14b. short password rejected by the API", /at least 8/.test(apiShort.error), apiShort.error);
+    // G-9 boundary: 7 characters — enough under the old 6-character rule — is now refused by both.
+    await ev(fill([["reg-password", "Abcdef1"], ["confirm-password", "Abcdef1"]]));
+    await submitRegister(); await sleep(500);
+    const v7 = await regMsg();
+    check("14c. a 7-character password is rejected in the form (G-9 minimum of 8)", /at least 8/i.test(v7) && !net.some(n => n.path === "/api/register"), v7);
+    const api7 = await (await fetch("http://127.0.0.1:5055/api/register", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ fullName: "X", email: `x7${stamp}@gmail.com`, password: "Abcdef1" }) })).json();
+    check("14d. a 7-character password is rejected by the API", /at least 8/.test(api7.error), api7.error);
 
     /* 1–3. Register a Gmail account via the form */
     await ev(fill([["fullname", "Auth E2E"], ["reg-email", email], ["phone", "0200000000"], ["reg-password", pass1], ["confirm-password", pass1]]));

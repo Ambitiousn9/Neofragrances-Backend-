@@ -258,7 +258,7 @@ async function integrationTests() {
   const mx0 = stats.mx;
   const regs = [];
   for (let i = 0; i < 10; i++) regs.push(await register({ fullName: "RL Test", email: `rl-reg-${i}@example.invalid`, password: "123" }, IP7));
-  check("R1 ten invalid registrations get the existing 400 short-password response", regs.every(r => r.status === 400 && /at least 6/i.test((r.data || {}).error || "")), statuses(regs));
+  check("R1 ten invalid registrations get the existing 400 short-password response", regs.every(r => r.status === 400 && /at least 8/i.test((r.data || {}).error || "")), statuses(regs));
   const reg11 = await register({ fullName: "RL Test", email: "rl-reg-10@example.invalid", password: "123" }, IP7);
   check("R2 the eleventh registration attempt is 429 JSON, code RATE_LIMITED, Retry-After 1..3600", is429(reg11, 3600), { status: reg11.status, data: reg11.data, ra: reg11.retryAfter });
   const reg12 = await register({ fullName: "RL Test", email: "rl-reg-valid-shape@example.invalid", password: "a-long-enough-password" }, IP7);
