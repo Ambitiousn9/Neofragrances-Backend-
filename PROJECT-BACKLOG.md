@@ -420,27 +420,47 @@ Dependencies & risks / Next action.
 - Dependencies & risks: P7.
 - Next action: after P7.1/P7.2.
 
-**P2.6 — QA-001: Paystack test checkout completed, but the callback page did not appear** · *NEEDS VERIFICATION*
+**P2.6 — QA-001: Paystack test checkout completed, but the callback page did not appear** · *COMPLETE (Local)*
 - Required: after a Paystack test payment, the customer returns to `payment-callback.html` and sees the result
-  of their order.
+  of their order — including when the checkout is started from another device on the LAN (e.g. an iPhone).
 - Exists:
-  - Paystack's return address is built from `FRONTEND_URL` (`server.js:2456`), which is
-    `http://127.0.0.1:5500` locally;
-  - `payment-callback.html` exists and is exempt from the maintenance redirect (P1.9).
-- Remains:
-  - reproduce it and record the device and address the checkout was started from, the URL Paystack returned
-    to, and whether an order (or a payment issue) was created for that reference;
-  - find the root cause and fix it.
-  - **Not yet confirmed (hypothesis only):** if the checkout was started from another device or address
-    (e.g. the iPhone on `http://172.20.10.3:5500`), Paystack returns the browser to `127.0.0.1:5500`, which that
-    device cannot reach. Runbook §2.7 already notes that checkout cannot complete on a phone.
-- Evidence: reported by the owner on 2026-11-14; `server.js:2456`; `.env` `FRONTEND_URL=http://127.0.0.1:5500`.
+  - **cause (confirmed):** Paystack's return address was always `FRONTEND_URL` + `/payment-callback.html`,
+    and `FRONTEND_URL` is `http://127.0.0.1:5500` locally. A checkout started on the iPhone at
+    `http://172.20.10.3:5500` was sent back to `127.0.0.1`, which on the phone is the phone itself, so the
+    callback page never loaded and that payment was never settled;
+  - **fix:** `paymentCallbackUrl(req)` (`server.js:76–87`, used by `/api/payments/initialize`) returns the
+    customer to the request's `Origin` only when it exactly matches an allowed origin (the same set CORS uses);
+    anything else, including no `Origin`, falls back to `FRONTEND_URL`. `Host`, `Referer` and `X-Forwarded-*`
+    are never read. Verification and password-reset email links are unchanged;
+  - **end-to-end retest on the iPhone (2026-11-14):** the checkout started at `http://172.20.10.3:5500`
+    returned to the callback page, which showed "Thank you — your order is confirmed".
+- Remains: nothing for QA-001 itself. Separate outstanding observation (**not** a QA-001 failure): an earlier,
+  separate test transaction (about 10:30 on 2026-11-14, account #597, before the fix) remains unsettled in
+  Paystack's test mode and has no local order. It is deliberately not being settled or recovered.
+- Evidence:
+  - fix commit `77c3e8b`, pushed to `rebuild` `feature/neofragrances-project-baseline`;
+  - tests: payment-reliability-tests 79/79, including CB1–CB8 (laptop, iPhone-LAN and production-style
+    origins return to themselves; unapproved or look-alike origins, no `Origin` and forwarded headers fall back;
+    the path stays `/payment-callback.html`). Mutation runs (old line, any `Origin`, `X-Forwarded-Host`) each fail;
+  - **read-only verification of the resulting order** against `neofragrances` on 127.0.0.1:3308. Identity
+    confirmed: port 3308, data directory `C:\NeoFragrances-MariaDB\data\`, hostname AMBITIOUS. Findings:
+    - order **#527**, created 2026-11-14 12:54:05, status **Processing**, total **GH¢968.00**;
+    - payment reference `NF-1794660829325-597-da03b032`; exactly one order carries it (no duplicate);
+    - customer account **#597**; delivery address #384, owned by #597;
+    - two order items: product **#60002** ×1 and product **#90015** ×1, each at **GH¢480.00**
+      (items GH¢960.00 + shipping **GH¢8.00** = GH¢968.00; no coupon);
+    - stock of both products **20 → 19** (2026-11-13 verified dump vs now), matching the quantities ordered.
+      They are the only products updated that day, both at 12:54:05;
+    - no `payment_issues` entry for this reference or order, and the `payment_issues` table is empty;
+    - **no `order_status_history` row for #527 — expected:** settlement does not create a status-history
+      entry; only admin status changes (and migration 006's one-off baseline) do.
 - Dependencies & risks:
-  - **locally the Paystack webhook is not registered (P7.3)**, so the browser callback is the only local path that
-    settles a payment. If the callback never ran, a paid test transaction may have no local order;
-  - P0.6; P2.3; P8.5.
-- Next action: owner states how the test was run, then a read-only check of `orders` / `payment_issues` for that
-  reference, then a reproduction from `http://127.0.0.1:5500` on the laptop (separate approval).
+  - locally the Paystack webhook is not registered (P7.3), so the browser callback remains the only local path
+    that settles a payment;
+  - each LAN session still needs the API started with that origin in `CORS_ORIGINS` (P0.6);
+  - on staging and production the return address must still be checked with the real Netlify origin (P7.5, P8.5).
+- Next action: none for QA-001. Owner decision only if the earlier unsettled test transaction should ever be
+  addressed (not planned).
 
 ### Phase 3 — Storefront improvements
 *Objective: a complete, honest, accessible storefront and admin experience.*
