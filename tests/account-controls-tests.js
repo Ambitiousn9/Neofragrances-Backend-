@@ -370,7 +370,17 @@ const waitUp = async (base) => { for (let i = 0; i < 80; i++) { try { await fetc
     await go(`${FRONT}/admin/login.html`);
     await ev(`localStorage.setItem("neofragrances_auth", ${JSON.stringify(adminAuth)}); true`);
 
+    // Render waits (2026-11-14): a run under load checked A68 while the page
+    // still showed its loading skeleton, and A69-A77 cascaded. The detail page
+    // is rendered once it is no longer aria-busy and an account action (either
+    // one) exists; the list once it is no longer aria-busy and #c-count has
+    // text. The waits never require the state the checks below assert.
+    const ADMIN_RENDER_MS = 20000;
+    const detailRendered = `!document.querySelector('[aria-busy="true"]') && !!document.querySelector('[data-account]')`;
+    const listRendered = `!document.querySelector('[aria-busy="true"]') && !!(document.getElementById("c-count") || {}).textContent`;
+
     await go(`${FRONT}/admin/customer.html?id=${custId}`);
+    await waitFor(detailRendered, ADMIN_RENDER_MS);
     check("A68. the detail page offers a Disable action for an active account",
       await ev(`!!document.querySelector('[data-account="disable"]')`), await ev(`document.getElementById("page-actions").innerText`));
     check("A69. an active account shows the Active badge", await ev(`document.body.innerText.includes("Active")`));
@@ -388,6 +398,7 @@ const waitUp = async (base) => { for (let i = 0; i < 80; i++) { try { await fetc
     await shot("02-detail-disabled");
 
     await go(`${FRONT}/admin/customers.html`);
+    await waitFor(listRendered, ADMIN_RENDER_MS);
     check("A74. the customers list marks the account Disabled", await ev(`document.body.innerText.includes("Disabled")`));
     check("A75. the list offers a status filter", await ev(`!!document.getElementById("c-status")`));
     await ev(`const s=document.getElementById("c-status"); s.value="disabled"; s.dispatchEvent(new Event("change",{bubbles:true})); true`);
