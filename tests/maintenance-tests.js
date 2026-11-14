@@ -231,7 +231,15 @@ const waitUp = async (base) => { for (let i = 0; i < 80; i++) { try { await fetc
     await send("Page.enable"); await send("Runtime.enable"); await send("Network.enable"); await send("Network.setCacheDisabled", { cacheDisabled: true });
     await send("Fetch.enable", { patterns: [{ urlPattern: "http://localhost:5000/*" }] });
     const ev = async e => { const res = await send("Runtime.evaluate", { expression: e, returnByValue: true, awaitPromise: true }); return res.result?.result?.value; };
-    const go = async url => { const b = loads; await send("Page.navigate", { url }); for (let i = 0; i < 150 && loads === b; i++) await sleep(100); await sleep(2200); };
+    // Page.navigate may get no answer when the page redirects itself while the navigation
+    // is still in flight (js/main.js's maintenance redirect; seen 2026-11-14). That is not a
+    // failure: carry on and let each check judge the page's actual location.
+    const go = async url => {
+      const b = loads;
+      try { await send("Page.navigate", { url }); }
+      catch (e) { if (!/^CDP Page\.navigate gave no answer/.test(e.message)) throw e; console.log(`(Page.navigate to ${url} got no answer; continuing)`); }
+      for (let i = 0; i < 150 && loads === b; i++) await sleep(100); await sleep(2200);
+    };
     // Screenshots are evidence, not assertions: one that fails is reported and skipped.
     const shot = async name => {
       try {
