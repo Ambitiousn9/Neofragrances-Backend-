@@ -180,27 +180,74 @@ const waitUp = async (base) => { for (let i = 0; i < 80; i++) { try { await fetc
     r = await call(API, "POST", "/api/payments/webhook", null, { event: "charge.success", data: { reference: "NF-maint-probe-0000" } });
     check("M26. Paystack WEBHOOK is reachable — not a maintenance 503 (a 5xx would make Paystack retry then give up)", !(r.status === 503 && r.data && r.data.code === "MAINTENANCE_MODE"), `${r.status} ${r.data && r.data.code}`);
 
+    /* ---------- path casing (Phase 2 step 1): Express routes case-insensitively ---------- */
+    const initCased = [];
+    for (const u of ["/API/payments/initialize", "/Api/Payments/Initialize"]) {
+      const x = await call(API, "POST", u, tCust, { items: [] });
+      initCased.push(x.status === 503 && x.data && x.data.code === "MAINTENANCE_MODE" ? "503" : `${u} ${x.status}`);
+    }
+    check("M26a. payment INITIALIZATION in other casings is blocked too (/API/…, /Api/…)", initCased.every(s => s === "503"), initCased.join(","));
+    const casedBlocked = [];
+    for (const [m, u] of [["GET", "/API/products"], ["GET", "/Api/Offers/Active"], ["POST", "/aPi/register"], ["POST", "/API/TRACK-ORDER"]]) {
+      const x = await call(API, m, u, null, m === "POST" ? {} : undefined);
+      if (!(x.status === 503 && x.data && x.data.code === "MAINTENANCE_MODE")) casedBlocked.push(`${m} ${u} ${x.status}`);
+    }
+    check("M26b. customer routes in other casings return the maintenance 503", casedBlocked.length === 0, casedBlocked.join(","));
+    r = await call(API, "PATCH", "/API/ME", tAdmin, { full_name: "Should Not Apply Either" });
+    const stillUnchanged = (await q("SELECT full_name FROM users WHERE id = ?", [adminId]))[0];
+    check("M26c. PATCH /API/ME is blocked (503) and changed nothing", r.status === 503 && r.data && r.data.code === "MAINTENANCE_MODE" && stillUnchanged.full_name === "Maint Admin", `${r.status} ${stillUnchanged.full_name}`);
+    const casedBypass = [
+      (await call(API, "GET", "/API/HEALTH")).status,
+      (await call(API, "GET", "/API/ADMIN/SUMMARY", tAdmin)).status,
+      (await call(API, "GET", "/Api/System/Status")).status,
+    ];
+    check("M26d. bypass routes in other casings still answer (health, admin API with an admin token, probe)", casedBypass.every(s => s === 200), JSON.stringify(casedBypass));
+
     /* ---------- client-side exemptions in a real browser ---------- */
     const profile = path.join(os.tmpdir(), "nf-edge-maint"); fs.rmSync(profile, { recursive: true, force: true });
-    edge = spawn("C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", ["--headless=new", `--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${profile}`, "--no-first-run", "about:blank"], { stdio: "ignore" });
-    let wsUrl; for (let i = 0; i < 150 && !wsUrl; i++) { try { wsUrl = (await (await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`)).json()).find(t => t.type === "page")?.webSocketDebuggerUrl; } catch (e) {} if (!wsUrl) await sleep(200); }
+    // Sync and background networking off (same flags as e2e-checkout.js): a fresh profile can
+    // otherwise open edge://sync-confirmation-dialog, which backgrounds the test tab so a
+    // screenshot never completes (seen 2026-11-14).
+    edge = spawn("C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", ["--headless=new", `--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${profile}`, "--no-first-run",
+      "--no-default-browser-check", "--disable-background-networking", "--disable-component-update", "--disable-sync", "about:blank"], { stdio: "ignore" });
+    let wsUrl; for (let i = 0; i < 150 && !wsUrl; i++) { try { const ts = (await (await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`)).json()).filter(t => t.type === "page"); wsUrl = (ts.find(t => t.url === "about:blank") || ts.find(t => !t.url.startsWith("edge://")))?.webSocketDebuggerUrl; } catch (e) {} if (!wsUrl) await sleep(200); }
     ws = new WebSocket(wsUrl); await new Promise(res => ws.addEventListener("open", res, { once: true }));
     let id = 0, loads = 0; const pending = new Map();
     ws.addEventListener("message", msg => {
       const m = JSON.parse(msg.data); const p = m.params || {};
       if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); return; }
-      if (m.method === "Fetch.requestPaused") send("Fetch.continueRequest", { requestId: p.requestId, url: p.request.url.replace("http://localhost:5000", API) });
+      if (m.method === "Fetch.requestPaused") send("Fetch.continueRequest", { requestId: p.requestId, url: p.request.url.replace("http://localhost:5000", API) }).catch(() => {});
       if (m.method === "Page.loadEventFired") loads++;
     });
-    const send = (method, params = {}) => new Promise(res => { const i = ++id; pending.set(i, res); ws.send(JSON.stringify({ id: i, method, params })); });
+    // Every CDP command is bounded: a command that never answers fails the run (and the
+    // finally block still cleans up) instead of hanging it.
+    const CDP_TIMEOUT_MS = 15000;
+    const send = (method, params = {}) => new Promise((res, rej) => {
+      const i = ++id;
+      const t = setTimeout(() => { pending.delete(i); rej(new Error(`CDP ${method} gave no answer within ${CDP_TIMEOUT_MS} ms`)); }, CDP_TIMEOUT_MS);
+      pending.set(i, m => { clearTimeout(t); res(m); });
+      ws.send(JSON.stringify({ id: i, method, params }));
+    });
     await send("Page.enable"); await send("Runtime.enable"); await send("Network.enable"); await send("Network.setCacheDisabled", { cacheDisabled: true });
     await send("Fetch.enable", { patterns: [{ urlPattern: "http://localhost:5000/*" }] });
     const ev = async e => { const res = await send("Runtime.evaluate", { expression: e, returnByValue: true, awaitPromise: true }); return res.result?.result?.value; };
     const go = async url => { const b = loads; await send("Page.navigate", { url }); for (let i = 0; i < 150 && loads === b; i++) await sleep(100); await sleep(2200); };
-    const shot = async name => { const res = await send("Page.captureScreenshot", { format: "png" }); fs.writeFileSync(path.join(SHOTS, name + ".png"), Buffer.from(res.result.data, "base64")); };
+    // Screenshots are evidence, not assertions: one that fails is reported and skipped.
+    const shot = async name => {
+      try {
+        await send("Page.bringToFront");
+        const res = await send("Page.captureScreenshot", { format: "png" });
+        fs.writeFileSync(path.join(SHOTS, name + ".png"), Buffer.from(res.result.data, "base64"));
+      } catch (e) { console.log(`(screenshot ${name} skipped: ${e.message})`); }
+    };
 
     await go(`${FRONT}/index.html`);
-    check("M27. a normal storefront page redirects to the maintenance page", (await ev("location.pathname")).endsWith("/maintenance.html"), await ev("location.pathname"));
+    // The redirect follows an async status probe, so on a slow machine it can land after
+    // go()'s fixed wait (seen 2026-11-14). Poll for it for up to 15 s instead.
+    let p27 = String(await ev("location.pathname"));
+    for (let i = 0; i < 30 && !p27.endsWith("/maintenance.html"); i++) { await sleep(500); p27 = String(await ev("location.pathname")); }
+    if (p27.endsWith("/maintenance.html")) await sleep(1500); // let the maintenance page finish loading
+    check("M27. a normal storefront page redirects to the maintenance page", p27.endsWith("/maintenance.html"), p27);
     await shot("01-maintenance-page");
     // Compared case-insensitively on purpose: innerText reflects CSS
     // text-transform, and .maint-brand / .maint-status are intentionally

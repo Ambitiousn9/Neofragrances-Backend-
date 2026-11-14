@@ -116,7 +116,14 @@ app.use(express.json({
      GET  /api/system/status       the maintenance probe itself.
 
    The bypass check runs BEFORE the settings read, so a bypassed route — health
-   above all — never depends on the settings query succeeding. */
+   above all — never depends on the settings query succeeding.
+
+   The path is lower-cased before both checks because Express matches routes
+   case-insensitively: "/API/payments/initialize" reaches the same handler as
+   "/api/payments/initialize", so the guard must treat it as an /api/ path too.
+   (security-headers.js lower-cases for the same reason.) A differently-cased
+   bypass path is still bypassed, which adds nothing: /api/admin/* keeps
+   requireAdmin and the other bypasses are open to everyone anyway. */
 const MAINTENANCE_BYPASS_PREFIXES = ["/api/admin/"];
 const MAINTENANCE_BYPASS_EXACT = new Set([
   "POST /api/login",
@@ -135,7 +142,7 @@ function maintenanceBypassed(method, routePath) {
 }
 
 app.use(async (req, res, next) => {
-  const routePath = req.path;
+  const routePath = req.path.toLowerCase();
   if (!routePath.startsWith("/api/")) return next();
   if (maintenanceBypassed(req.method, routePath)) return next();
   let on = false;
