@@ -1,5 +1,20 @@
 // server.js — the main Express app
 require("dotenv").config();
+
+// Startup configuration checks (G-6 / G-7, config-check.js) — before anything else loads or
+// listens. A missing JWT_SECRET, weak or shared production secrets, or a Render deployment
+// without NODE_ENV=production stop the process here with a clear message (variable names only,
+// never values) instead of surfacing later as 500s or development behaviour in production.
+{
+  const { errors, warnings } = require("./config-check").checkStartupConfig(process.env);
+  for (const w of warnings) console.warn(`WARNING: ${w}`);
+  if (errors.length) {
+    for (const e of errors) console.error(`CONFIGURATION ERROR: ${e}`);
+    console.error("NeoFragrances API not started.");
+    process.exit(1);
+  }
+}
+
 const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
@@ -3642,6 +3657,24 @@ app.post("/api/admin/maintenance", requireAdmin, async (req, res) => {
     console.error(err);
     res.status(500).json({ error: "Could not save the maintenance configuration." });
   }
+});
+
+// ---------- JSON error responses (G-7) ----------
+// Express's default error handler writes an HTML page that, outside production, includes the
+// stack trace. Errors that get this far are request-parsing failures from express.json
+// (malformed or oversized bodies — err.expose is set and the status is a 4xx) or something a
+// route did not catch. Both are answered with JSON; the detail is logged here only. Unknown
+// routes are not errors and keep Express's default 404. Registered after every route.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  const status = Number(err && (err.status || err.statusCode));
+  if (err && err.expose && status >= 400 && status < 500) {
+    if (err.type === "entity.parse.failed") return res.status(400).json({ error: "The request body is not valid JSON.", code: "INVALID_JSON" });
+    if (status === 413) return res.status(413).json({ error: "The request body is too large.", code: "PAYLOAD_TOO_LARGE" });
+    return res.status(status).json({ error: "The request could not be processed.", code: "BAD_REQUEST" });
+  }
+  console.error("Unhandled error:", (err && err.stack) || err);
+  res.status(500).json({ error: "Something went wrong. Please try again." });
 });
 
 const PORT = process.env.PORT || 5000;

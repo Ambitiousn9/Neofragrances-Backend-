@@ -32,8 +32,12 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const servers = [];
 // Guarded child (identity-checked against the nf_test_* database), or — noDb — a child with
 // no database at all (127.0.0.1:1). Both wait for server.js's own listening line.
+// Throwaway secrets for every child: server.js refuses to start without JWT_SECRET, and in
+// production (the PROD_PORT instance) needs a distinct PAYMENT_SIGNING_SECRET of 32+ characters
+// (config-check.js, G-6). The isolation guard blocks .env, so nothing else would supply them.
+const SECRETS = { JWT_SECRET: require("crypto").randomBytes(32).toString("hex"), PAYMENT_SIGNING_SECRET: require("crypto").randomBytes(32).toString("hex") };
 async function startServer(port, extraEnv, { noDb = false } = {}) {
-  const opts = { suite: "platform-tests.js", port, env: Object.assign({ SENDGRID_API_KEY: "" }, extraEnv) };
+  const opts = { suite: "platform-tests.js", port, env: Object.assign({ SENDGRID_API_KEY: "" }, SECRETS, extraEnv) };
   const srv = noDb ? await iso.startNoDbServer(opts) : await iso.startGuardedServer(opts);
   servers.push(srv);
   return srv;

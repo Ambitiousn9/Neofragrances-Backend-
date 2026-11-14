@@ -187,11 +187,15 @@ async function integrationTests() {
   const prePublic = await call("OPTIONS", "/api/products", { headers: { Origin: ALLOWED_ORIGIN, "Access-Control-Request-Method": "GET" } });
   headerCheck("I14 CORS preflight on a public route: all headers, not no-store", prePublic, { status: 204, noStore: false });
 
-  // Malformed JSON and 404 (Express's default handler writes these)
+  // Malformed JSON is answered by the app's JSON error handler (G-7), so the response keeps the
+  // API's own headers; 404 is still written by Express's default handler (finalhandler).
+  const jsonError = (r, code) => { try { const b = JSON.parse(r.text); return b.code === code && typeof b.error === "string" && !/\bat\s|SyntaxError|node_modules/.test(r.text); } catch (e) { return false; } };
   const malformed = await call("POST", "/api/login", { raw: "{not json" });
-  headerCheck("I15 malformed JSON body → 400 with every header (finalhandler's strict CSP)", malformed, { status: 400, csp: FINALHANDLER_CSP, noStore: false });
+  headerCheck("I15 malformed JSON body → 400 with every header (the API's own CSP)", malformed, { status: 400, noStore: false });
+  check("I15b malformed JSON → JSON body INVALID_JSON, no stack trace", jsonError(malformed, "INVALID_JSON"), malformed.text.slice(0, 120));
   const malformedPrivate = await call("POST", "/api/me/password", { raw: "{not json" });
-  headerCheck("I16 malformed JSON on a private route → 400 with every header + no-store", malformedPrivate, { status: 400, csp: FINALHANDLER_CSP, noStore: true });
+  headerCheck("I16 malformed JSON on a private route → 400 with every header + no-store", malformedPrivate, { status: 400, noStore: true });
+  check("I16b malformed JSON on a private route → JSON body INVALID_JSON, no stack trace", jsonError(malformedPrivate, "INVALID_JSON"), malformedPrivate.text.slice(0, 120));
   const notFound = await call("GET", "/api/does-not-exist");
   headerCheck("I17 unknown route → 404 with every header (finalhandler's strict CSP)", notFound, { status: 404, csp: FINALHANDLER_CSP, noStore: false });
   const lookalike = await call("GET", "/api/media");
