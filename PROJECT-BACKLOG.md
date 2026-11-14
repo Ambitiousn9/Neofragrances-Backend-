@@ -132,8 +132,9 @@ Dependencies & risks / Next action.
   - confirm in a browser, on the laptop and on the iPhone, that products and offers display (the API side is
     verified; the page-level check has not been recorded);
   - the API must be restarted with `CORS_ORIGINS` in each new session, and the LAN IP changes with the network;
-  - checkout cannot complete on a phone, because Paystack callbacks and email links use `FRONTEND_URL`
-    (127.0.0.1); see P2.6.
+  - verification and password-reset email links still use `FRONTEND_URL` (127.0.0.1), so on a phone they open
+    the wrong address. (Paystack checkout on a phone now returns to the LAN address: QA-001 fixed in `77c3e8b`
+    and verified with order #527; see P2.6.)
 - Evidence:
   - diagnosis (2026-11-14 morning): the CORS allowlist (`server.js:58–74`) is `CORS_ORIGINS` + `FRONTEND_URL`
     + `http://127.0.0.1:5500` and `http://localhost:5500` outside production. The API then running answered
@@ -985,8 +986,9 @@ Dependencies & risks / Next action.
 - Exists: a full local test payment completed on 2026-10-02 (before the address-validation change).
 - Remains: the staging run.
 - Evidence: old backlog #16b; no staging evidence.
-- Dependencies & risks: P7.3, P2.3, and the local callback problem QA-001 (P2.6).
-- Next action: after P7.3 and P2.6.
+- Dependencies & risks: P7.3, P2.3. The QA-001 return-address fix (P2.6, complete locally) must be rechecked
+  with the real staging origin.
+- Next action: after P7.3.
 
 **P8.6 — Rollback plan** · *NOT STARTED*
 - Required: a written way back for code and database.
@@ -1051,7 +1053,7 @@ Dependencies & risks / Next action.
 | B2 | Single-disk backups (P0.3) | Data safety | — |
 | D14 | Image storage for uploads (admin product images P3.13, customer profile pictures P3.15) | P3.13 image upload, P3.15 | Owner |
 | D15 | Scrolling reviews: minimum genuine-review count and placement (P3.14) | P3.14 | Owner |
-| D16 | How the QA-001 test checkout was run (device and address) (P2.6) | P2.6 | Owner |
+| D16 | ~~How the QA-001 test checkout was run (device and address) (P2.6)~~ — **resolved**: the owner confirmed an iPhone at `http://172.20.10.3:5500`; QA-001 fixed in `77c3e8b` and verified with order #527 on 2026-11-14 | — | — |
 | B3 | ~~Running local API can't be restarted from a non-elevated session (P0.6)~~ — **resolved**: the API was restarted with the LAN origin at 09:19 on 2026-11-14 and confirmed healthy at 11:43 | — | — |
 
 ---
@@ -1072,7 +1074,8 @@ Nothing here may be invented; each item waits for the owner.
 - **Dark-mode design choices** (D4).
 - **Scrolling-reviews rules** — minimum genuine-review count and placement (D15, P3.14).
 - **Image-storage choice** for admin and customer uploads (D14, P3.13, P3.15).
-- **QA-001 details** — device, address and Paystack reference of the test checkout (D16, P2.6).
+- ~~**QA-001 details** — device, address and Paystack reference of the test checkout (D16, P2.6).~~ —
+  **supplied 2026-11-14**: iPhone at `http://172.20.10.3:5500`; the retest produced order #527 (P2.6).
 - **Production environment values** — set by the owner in Render/Netlify; never shared in documents (P7.2).
 
 ---
@@ -1105,7 +1108,8 @@ stale — P2.4).
 1. **Local hygiene:**
    - browser check of LAN access on laptop and iPhone (P0.6; the API side was confirmed at 11:43 on 2026-11-14);
    - **copy the database backups off this machine** (P0.3);
-   - **investigate QA-001**, the missing payment callback page (P2.6), starting with read-only checks.
+   - ~~investigate QA-001, the missing payment callback page (P2.6)~~ — **done 2026-11-14**: fixed in `77c3e8b`,
+     verified with order #527.
 2. **Small, safe code fixes** (each needs approval):
    - the product-details `???` notes bug (P3.4);
    - email normalisation, G-8 (P1.11);
