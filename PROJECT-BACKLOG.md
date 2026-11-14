@@ -314,21 +314,58 @@ Dependencies & risks / Next action.
 - Dependencies & risks: P5.1.
 - Next action: Phase 5.
 
-**P1.11 — G-8: normalise email at registration and login** · *NOT STARTED*
+**P1.11 — G-8: normalise email at registration and login** · *COMPLETE (Local)*
 - Required: emails trimmed and lower-cased consistently on every path.
-- Exists: only the Google sign-in path normalises (`server.js:464`).
-- Remains: `/api/register` stores the email as typed (`server.js:323–345`); login needs to match the same way.
-- Evidence: code reading, 2026-11-14 audit.
-- Dependencies & risks: existing accounts with mixed-case emails need a duplicate check before changing lookups.
-- Next action: small fix plus a check for existing duplicates (read-only first).
+- Exists:
+  - `normalizeEmail()` (trim + lower-case) in register (new accounts are stored normalised), login, Google
+    sign-in, resend verification and forgot password;
+  - every users-by-email lookup uses `LOWER(email) = ?`, so accounts stored with capitals by older code still
+    match whatever the column collation (production TiDB's is unverified);
+  - a different capitalisation can no longer dodge the resend-verification or forgot-password cooldowns.
+    No database rows were changed.
+- Remains: nothing for P1.11.
+- Evidence:
+  - read-only duplicate check first (2026-11-14): `users.email` is UNIQUE, utf8mb4_general_ci; the working
+    database has 3 accounts (2 stored with capitals) and 0 case or space duplicates; the test database has 0;
+  - backend commits `43e3427` (the fix) and `406d9a1` (account-controls render waits), pushed to `rebuild`
+    `feature/neofragrances-project-baseline` (2026-11-14);
+  - new DB-free `tests/email-normalisation-tests.js` 18/18; mutation runs (no lower-casing, the old login SQL,
+    storing the raw input) each fail it;
+  - guarded on `nf_test_phase1_20261029` at 127.0.0.1:3308: auth-e2e 28/28, account-api 50/50, account-e2e 61/61,
+    account-controls 87/87. The first account-controls run was 77/87: A68 read the admin customer page while it
+    still showed its loading skeleton, and A69–A77 cascaded. An unchanged re-run passed 87/87, and `406d9a1` added
+    render waits, after which it passed 87/87 again. The working database was identical before and after every run.
+- Dependencies & risks: if production holds two accounts differing only in case, LOWER() lookups would match both;
+  repeat the read-only duplicate check on production before release (part of P5.2).
+- Next action: none locally; the production duplicate check with P5.2.
 
-**P1.12 — G-9: raise the minimum password length** · *NOT STARTED*
+**P1.12 — G-9: raise the minimum password length** · *COMPLETE (Local)*
 - Required: a minimum of 8 or more characters, applied the same way at registration, reset and change, on frontend and backend.
-- Exists: 6 characters (`server.js:328`, `:2244`).
-- Remains: the change on both sides, plus tests.
-- Evidence: code reading, 2026-11-14.
-- Dependencies & risks: messages and validation in `js/validation.js` and the account pages.
-- Next action: owner confirms the new minimum.
+- Exists:
+  - owner confirmed **8** (2026-11-14);
+  - backend: one `MIN_PASSWORD_LENGTH = 8` used by register, reset and change. Registration also refuses a
+    password that is not text (a number used to reach bcrypt and return 500);
+  - frontend: register (`js/validation.js` + hint), reset (`js/password-reset.js`, `minlength` + hint) and
+    change (`js/account.js`) all say and check 8;
+  - login applies no minimum, so accounts whose passwords were set under the old 6-character rule still sign in.
+    The new rule applies only when a password is set or changed.
+- Remains: nothing for P1.12.
+- Evidence:
+  - backend `dfc6ccd` and frontend `d60f0ef`, pushed to `rebuild` `feature/neofragrances-project-baseline`
+    (2026-11-14);
+  - new DB-free backend `tests/password-minimum-tests.js` 17/17. It covers 7 refused and 8 accepted on all three
+    routes, non-text refused before any query, and an old 6-character password still logging in. Three mutations
+    each fail it;
+  - new frontend `tests/password-minimum-tests.js` 14/14. It runs the real validation code in a vm, and four
+    mutations each fail it;
+  - guarded on `nf_test_phase1_20261029` at 127.0.0.1:3308: auth-e2e 30/30 (new 7-character checks 14c/14d in the form and the API),
+    account-api 50/50, account-e2e 61/61 and account-controls 87/87. The first account-e2e run was 59/61 under
+    load: checks 2/2b read the overview while it was still loading. An unchanged re-run passed 61/61. The working
+    database was identical before and after;
+  - all DB-free and frontend suites green; `_headers` CSP hashes unaffected (inline scripts unchanged).
+- Dependencies & risks: none known. Existing short passwords are not forced to change; that would be a separate
+  decision.
+- Next action: none locally; include in the P2.2 full regression.
 
 **P1.13 — G-4: rate limits and `trust proxy` behind Render** · *NEEDS VERIFICATION*
 - Required: client IPs are read correctly behind Render's proxy; limits behave on the real host.
@@ -1133,7 +1170,8 @@ Nothing here may be invented; each item waits for the owner.
 `nf_test_phase1_20261029` at 127.0.0.1:3308. The working database was unchanged.
 
 **Changes since then still need a full pass (P2.2):** T08 (`e45479b`), G-2 (`bac4433`), the maintenance fixes
-(`1143177`, `afbbe8a`, `660176a`) and R4 (`8234289`).
+(`1143177`, `afbbe8a`, `660176a`), R4 (`8234289`), QA-001 (`77c3e8b`), P3.4 (`670d75b`), G-8 (`43e3427`, `406d9a1`)
+and G-9 (`dfc6ccd`, `d60f0ef`).
 
 Re-run since the full pass:
 
@@ -1142,8 +1180,12 @@ Re-run since the full pass:
 | admin-api-tests | 112/112 (guarded) | 2026-11-14 |
 | maintenance-tests | 85/85 (guarded) | 2026-11-14 |
 | platform-tests | 19/19 (guarded) | 2026-11-14 |
-| Database-free (backend): admin-session 23, auth-rate-limit 51, security-headers 43, payment-reliability 71, payment-issues 84, password-session 33, startup-config 46, money-validation 11, maintenance-guard 22; isolated-db-guard 29 | all pass | 2026-11-14 |
-| Frontend: maintenance-page 22, storefront-security-headers 34, admin-security-headers 29, admin-maintenance 30, admin-logout 14, admin-payment-issues 30 (one long-standing review observation) | all pass | 2026-11-14 |
+| auth-e2e | 30/30 (guarded, after G-9) | 2026-11-14 |
+| account-api-tests | 50/50 (guarded, after G-9) | 2026-11-14 |
+| account-e2e | 61/61 (guarded, after G-9; first run 59/61, an overview loading flake) | 2026-11-14 |
+| account-controls-tests | 87/87 (guarded, after G-9) | 2026-11-14 |
+| Database-free (backend): admin-session 23, auth-rate-limit 51, security-headers 43, payment-reliability 79, payment-issues 84, password-session 33, startup-config 46, money-validation 11, maintenance-guard 22, email-normalisation 18, password-minimum 17; isolated-db-guard 29 | all pass | 2026-11-14 |
+| Frontend: maintenance-page 22, storefront-security-headers 34, admin-security-headers 29, admin-maintenance 30, admin-logout 14, admin-payment-issues 30 (one long-standing review observation), product-details-notes 13, password-minimum 14 | all pass | 2026-11-14 |
 
 Not run in their current form: `e2e-checkout.js` (P2.3). Per-suite detail: `tests/README.md` (some rows
 stale — P2.4).
@@ -1159,8 +1201,8 @@ stale — P2.4).
      verified with order #527.
 2. **Small, safe code fixes** (each needs approval):
    - the product-details `???` notes bug (P3.4);
-   - email normalisation, G-8 (P1.11);
-   - the password minimum, G-9 (P1.12);
+   - ~~email normalisation, G-8 (P1.11)~~ — **done 2026-11-14** (`43e3427`, `406d9a1`);
+   - ~~the password minimum, G-9 (P1.12)~~ — **done 2026-11-14**, minimum 8 (`dfc6ccd`, `d60f0ef`);
    - stale 009 comments (P6.7).
 3. **Fragrance Education integration (P3.1):** nav, footer, drawer and product-page links, plus the maceration
    section once the copy is approved.
