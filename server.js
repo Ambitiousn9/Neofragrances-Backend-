@@ -3391,8 +3391,10 @@ app.delete("/api/admin/coupons/:id", requireAdmin, async (req, res) => {
 });
 
 // ---------- Admin: payment issues (Payment Reliability Stage B) ----------
-// Reads and resolves payment_issues (migration 009 — PROPOSED, not applied anywhere
-// yet; until it is, these routes answer 500 and settlement is unaffected).
+// Reads and resolves payment_issues (migration 009 — applied LOCAL ONLY on 2026-10-17;
+// NOT applied to production, there is no staging yet, and not verified on TiDB; see the
+// Status header in migrations/009_payment_issues.sql). In any environment where 009 is
+// not applied, these routes answer 500 and settlement is unaffected.
 // Every route is requireAdmin. Errors follow the admin convention — 400 malformed,
 // 404 unknown id, 409 well formed but refused — and never 403, which admin-core.js
 // treats as an expired session.

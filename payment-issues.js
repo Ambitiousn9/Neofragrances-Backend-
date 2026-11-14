@@ -1,5 +1,7 @@
 // payment-issues.js — durable record of payments that could not be settled
-// (Payment Reliability Stage B, migration 009 — PROPOSED, not yet applied anywhere).
+// (Payment Reliability Stage B, migration 009 — applied LOCAL ONLY on 2026-10-17; NOT
+// applied to production, there is no staging yet, and not verified on TiDB; see the
+// Status header in migrations/009_payment_issues.sql).
 //
 // This is NOT a payment ledger. A row exists only when Paystack has confirmed a
 // payment (server-to-server) or a correctly signed charge.success webhook arrived,

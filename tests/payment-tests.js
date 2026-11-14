@@ -529,7 +529,7 @@ const MAX_FIXTURE_STOCK = MAX_QTY_PER_LINE - OVER_STOCK_PROBE; // 47
     await step("stop API server", async () => { const problem = await stopServer(server); if (problem) throw new Error(problem); });
 
     await step("payment_issues (Stage B)", async () => {
-      // Stage B (migration 009, proposed): settlement may record payment_issues rows for
+      // Stage B (migration 009, applied LOCAL ONLY; not in production): settlement may record payment_issues rows for
       // this run's payments. Delete exactly those — the references this run initialized,
       // as recorded by the mock Paystack (txs) — and only when the table exists, so the
       // cleanup is identical on a pre-009 database. Done first: its foreign keys are
