@@ -615,14 +615,27 @@ Dependencies & risks / Next action.
 - Dependencies & risks: a new migration; content sanitising; the image-storage decision.
 - Next action: post-launch unless the owner decides otherwise.
 
-**P3.3 — Whole-site dark mode (storefront and admin)** · *NOT STARTED*
+**P3.3 — R10: customer-facing light and dark mode (storefront and account area)** · *NOT STARTED*
+- **Owner-approved planned feature** (storefront roadmap **R10**, recorded 2026-11-15). Not an optional suggestion.
+  On 2026-11-15 the owner split the admin dashboard out of this task: it gets the same theme capability as the
+  separate task **P3.16**.
 - Required:
-  - a light/dark theme across the **entire storefront, the customer account area (My Account and its
-    pages) and the admin dashboard**;
-  - a user-accessible toggle;
-  - consistent behaviour in all three areas (same preference, same tokens, no flash of the wrong theme);
-  - readable text and consistent styling in both themes;
-  - contrast meeting WCAG AA in both themes.
+  - a light/dark theme across the **public storefront and the customer account area** (My Account and its pages);
+  - a **visible** theme toggle;
+  - the customer's choice is **remembered**;
+  - with no saved choice, the theme **follows the operating system** (`prefers-color-scheme`);
+  - **no flash of the wrong theme** while a page loads;
+  - accessible colour contrast (WCAG AA) and readable components in both themes;
+  - **every relevant page and interactive element** (forms, buttons, drawers, dialogs, toasts, skeletons,
+    product cards, the cart and checkout, the account sections) works in both themes.
+- Acceptance criteria:
+  - the toggle is reachable by keyboard, has an accessible name and reports its state;
+  - a saved choice survives navigation and reload; clearing it falls back to the OS setting;
+  - no wrong-theme flash on any storefront or account page (checked with throttled loading);
+  - contrast checked in both themes for text, links, buttons, focus rings and form fields;
+  - 320, 390 and 1366px checks of every storefront and account page in both themes, with no overflow,
+    CSP violations or console errors;
+  - the storefront CSP suite and the guarded browser suites pass; any new inline-script hash recorded.
 - Exists: **no theme implementation anywhere**: no `prefers-color-scheme`, no `data-theme`, no toggle, no
   stored preference. Foundation:
   - one shared `css/tokens.css` (77 custom properties) loaded by all 38 real pages, storefront and admin
@@ -630,19 +643,21 @@ Dependencies & risks / Next action.
 - Remains:
   - **colours outside tokens:** about 128 hex and 163 `rgba` values bypass the tokens, mostly in `style.css`,
     `admin.css`, `home.css`, `layout.css` and `maintenance.css`. Convert them to tokens.
-  - **theme mechanism:** define dark values; add the toggle (storefront header and admin shell); persist the
-    choice and respect the system preference.
+  - **theme mechanism:** define dark values; add the toggle (storefront header, reachable from the account
+    area; the admin shell is P3.16); persist the choice and respect the system preference.
   - **assets and accessibility:** handle images, the bottle-SVG fallback, focus rings and charts; check contrast.
   - **CSP:** a no-flash theme script in `<head>` would need a new CSP hash on every page, or must load as a
     file before CSS.
 - Evidence: 2026-11-14 grep of all CSS, HTML and JS; per-file colour counts.
 - Dependencies & risks:
-  - **sequencing: planned for after T04** (P2.1, the isolated test-database guard, COMPLETE (Local)
-    2026-11-13), so the guarded suites can check the themed pages;
-  - design decision (palette, toggle placement, default);
+  - **sequencing: planned for after T04** (P2.1, the isolated test-database guard). **This dependency is
+    satisfied:** P2.1 is COMPLETE (Local) since 2026-11-13, and all 17 database-backed suites ran green through
+    the guard on 2026-11-15 (P2.2, P2.3), so the guarded suites can check the themed pages;
+  - design decision D4 (palette, toggle placement, default);
   - G-2 CSP (P1.3);
-  - large surface for visual regressions.
-- Next action: owner design decision, then a token-mapping plan covering storefront and admin together.
+  - large surface for visual regressions;
+  - the admin counterpart P3.16 should reuse the same tokens and stored preference, but is built separately.
+- Next action: owner design decision D4, then a token-mapping plan for the storefront and account area.
 
 **P3.4 — Product-details page shows `???` notes** · *COMPLETE (Local)*
 - Required: placeholder notes are never shown as if they were real.
@@ -781,19 +796,30 @@ Dependencies & risks / Next action.
 - Dependencies & risks: migrations 002, 004, 005, 006, 007 and 009 in production.
 - Next action: Phase 5; owner decision on the remaining items.
 
-**P3.14 — SF-REV-01: continuously scrolling customer reviews (right to left)** · *NOT STARTED*
+**P3.14 — R11 / SF-REV-01: continuously scrolling customer reviews (right to left)** · *NOT STARTED*
+- **Owner-approved planned feature** (storefront roadmap **R11**, recorded 2026-11-15). Not an optional suggestion.
 - Required:
+  - a premium-looking, continuously moving review display;
+  - **genuine eligible customer reviews from the database only**;
   - customer reviews scroll continuously from right to left;
   - **every eligible genuine review can appear** in the moving display (it draws on all of them), rather than
     permanently showing a small fixed selection;
-  - review text, customer attribution and rating stay readable;
+  - review text, star rating and appropriate customer attribution stay readable;
   - responsive at all widths, mobile and desktop, with no clipping and no horizontal page overflow;
-  - restrained movement (no excessive speed or motion);
+  - smooth, restrained movement (no excessive speed or motion);
   - reduced-motion support (no automatic movement when the visitor asks for reduced motion);
-  - an accessible pause control, as well as pause on hover and keyboard focus, and duplicated copies hidden
-    from assistive technology;
-  - empty review data handled gracefully (the section stays hidden, as today);
+  - a **visible pause/resume control**, as well as pause on hover and keyboard focus, and duplicated copies
+    hidden from assistive technology;
+  - insufficient or empty review data handled gracefully (the section stays hidden, as today);
   - **genuine reviews only**, taken from the existing review data; no fabricated or placeholder reviews.
+- Acceptance criteria:
+  - every eligible review appears in the rotation over time (checked against the database for the test data);
+  - the pause/resume control works by mouse, touch and keyboard, has an accessible name and reports its state;
+  - hover and focus pause the movement; reduced motion shows a static, scrollable list;
+  - screen readers hear each review once;
+  - below the owner's minimum count the display does not animate (or stays hidden, as the owner decides);
+  - 320, 390 and 1366px checks: no clipping, overflow, CSP violations or console errors; guarded suite coverage
+    for the new endpoint.
 - Exists:
   - a homepage "Customer Reviews" section that shows up to 3 genuine reviews in a static grid and stays hidden
     when there are none (`index.html:158–167`, `js/home.js:22–23` and `:323+`, data from `GET /api/products/:id/reviews`);
@@ -811,20 +837,32 @@ Dependencies & risks / Next action.
   - the owner's rule that the homepage is enhanced, never redesigned;
   - no invented or placeholder reviews;
   - the CSP (styles in CSS files, no inline scripts);
-  - P3.3 dark mode.
-- Next action: owner decides the minimum review count and placement, then implement.
+  - P3.3 dark mode (R10);
+  - **review data must be genuine and reliable: coordinate with the storefront roadmap's R3 review-integrity
+    work** (P1.19: one review per customer per product, input limits);
+  - **owner decisions D15**: the minimum-review threshold and the display location both need owner confirmation.
+- Next action: owner decides the minimum review count and placement (D15), then implement after R3.
 
-**P3.15 — ACCT-AV-01: customer profile-picture upload** · *NOT STARTED*
+**P3.15 — R9 / ACCT-AV-01: customer profile-picture management** · *NOT STARTED*
+- **Owner-approved planned feature** (storefront roadmap **R9**, recorded 2026-11-15). Not an optional suggestion.
 - Required:
   - customers can upload a profile picture, preview it before saving, change or replace it, and remove it, from
     My Account;
   - a sensible fallback (a default avatar or the customer's initials) when no picture is set;
   - **secure validation**: allowed image types checked by content, not just extension; file-size and dimension
-    limits; re-encoding or metadata stripping;
+    limits; re-encoding or metadata stripping where appropriate;
   - **owner-only access**: a customer can manage only their own picture;
   - images stored and served safely (no user-controlled file names or paths, correct content type);
-  - responsive display on every account page that shows the picture;
+  - responsive display throughout the customer account area;
   - **durable storage**.
+- Acceptance criteria:
+  - tests for upload, preview-then-save, replacement (the old image is no longer served) and removal (the
+    fallback returns);
+  - invalid-file tests: wrong type, a renamed non-image, oversize file, oversize dimensions, empty file;
+  - ownership tests: another customer's token cannot replace, remove or address a picture it does not own;
+    signed-out requests are refused;
+  - stored images carry no EXIF/GPS metadata;
+  - 320, 390 and 1366px checks of every account view that shows the picture, with no CSP violations.
 - Exists:
   - nothing for uploads: the `users` table has no picture column (columns: id, full_name, email, google_id,
     auth_provider, phone, password_hash, role, created_at, updated_at, email_verified_at, disabled_at,
@@ -834,18 +872,34 @@ Dependencies & risks / Next action.
   - there is no avatar code in `js/account.js` / `my-account.html`.
 - Remains: everything:
   - the storage decision;
-  - a migration (010+);
+  - a migration (010+), if approved;
   - upload, replace and delete endpoints;
   - the account-page UI;
   - CSP `img-src` changes if images are served from an external host;
   - a privacy-policy update (P4.2).
 - Evidence: read-only `information_schema` query and code search (2026-11-14).
 - Dependencies & risks:
-  - **image storage**, shared with admin image upload (P3.13): Render's disk is ephemeral (decision D14);
+  - **owner decision D14 on persistent image storage**, shared with admin image upload (P3.13): Render's disk is
+    ephemeral;
+  - the required database migration, if approved;
+  - the relevant privacy-policy updates (P4.2);
+  - any necessary CSP changes (P1.3);
   - upload endpoints are a new attack surface;
-  - personal data;
-  - P4.2.
+  - personal data.
 - Next action: owner decision D14, then a design for review.
+
+**P3.16 — Admin dashboard light and dark mode** · *NOT STARTED*
+- **Owner-approved planned feature** (recorded 2026-11-15), split out of P3.3 at the owner's instruction: the
+  admin dashboard receives the same theme capability as the customer-facing task (R10), as a **separate
+  implementation task**.
+- Required: the same toggle, remembered preference, OS default, no wrong-theme flash and WCAG AA contrast as
+  P3.3, across every admin page (the 15 pages listed in P3.13), including tables, charts, dialogs and forms.
+- Exists: nothing (see P3.3); `admin.css` holds many of the colours that bypass `css/tokens.css`.
+- Remains: everything.
+- Acceptance criteria: as P3.3, for every admin page; admin-security-headers suite and the guarded admin
+  browser suites (admin-e2e, account-controls, scent-family-admin-e2e) pass.
+- Dependencies & risks: P3.3's tokens and design decision D4; the `/admin/*` CSP rule; T04 satisfied (see P3.3).
+- Next action: after P3.3, or alongside it once D4 is decided.
 
 ### Phase 4 — Content completion
 *Objective: every customer-facing page carries real, owner-approved information.*
@@ -1210,7 +1264,7 @@ Dependencies & risks / Next action.
 | D1 | Release path from `rebuild` to production (P6.6) | All of Phase 7 and 8 | Owner |
 | D2 | Read-only production TiDB version check (P5.2) | P5.1 migrations | Owner approval |
 | D3 | Staging hosts (P7.1) | P2.5, P7.x, P8.5 | Owner |
-| D4 | Dark-mode design: palette, toggle placement, default, CSP approach (P3.3) | P3.3 | Owner |
+| D4 | Dark-mode design: palette, toggle placement, default, CSP approach (P3.3 / R10, P3.16) | P3.3, P3.16 | Owner |
 | D5 | ~~Fragrance Guide placement and nav label (P3.1)~~ — **resolved**: the owner approved "Fragrance Guide" in the main nav, footer and mobile drawer; implemented in `a88a2b6` | — | — |
 | D6 | What to show instead of generated descriptions (P3.5) | P3.5 | Owner |
 | D7 | Off-machine backup destination (P0.3) | P0.3 | Owner |
@@ -1222,8 +1276,8 @@ Dependencies & risks / Next action.
 | D13 | Brand-name spelling (P4.6) | P4.6 | Owner |
 | B1 | Owner content (section 7) | P4.x, P3.6 | Owner |
 | B2 | Single-disk backups (P0.3) | Data safety | — |
-| D14 | Image storage for uploads (admin product images P3.13, customer profile pictures P3.15) | P3.13 image upload, P3.15 | Owner |
-| D15 | Scrolling reviews: minimum genuine-review count and placement (P3.14) | P3.14 | Owner |
+| D14 | Image storage for uploads (admin product images P3.13, customer profile pictures P3.15 / R9) | P3.13 image upload, P3.15 | Owner |
+| D15 | Scrolling reviews: minimum genuine-review threshold and display location (P3.14 / R11) | P3.14 | Owner |
 | D16 | ~~How the QA-001 test checkout was run (device and address) (P2.6)~~ — **resolved**: the owner confirmed an iPhone at `http://172.20.10.3:5500`; QA-001 fixed in `77c3e8b` and verified with order #527 on 2026-11-14 | — | — |
 | B3 | ~~Running local API can't be restarted from a non-elevated session (P0.6)~~ — **resolved**: the API was restarted with the LAN origin at 09:19 on 2026-11-14 and confirmed healthy at 11:43 | — | — |
 
@@ -1314,7 +1368,9 @@ Per-suite detail: `tests/README.md` (some rows stale — P2.4).
    - ~~stale 009 comments (P6.7)~~ — **done 2026-11-14** (`ff5a9f4`).
 3. ~~**Fragrance Education integration (P3.1):** nav, footer, drawer and product-page links, plus the maceration
    section once the copy is approved.~~ — **done 2026-11-15** (frontend `a88a2b6`; P3.1 and P4.5 COMPLETE (Local)).
-4. **Dark mode (P3.3):** design decision, then a token-mapping plan for storefront and admin together, then implementation.
+4. **Owner-approved planned storefront features (recorded 2026-11-15):** R9 profile pictures (P3.15, needs D14),
+   R10 customer-facing light/dark mode (P3.3, needs D4; T04 dependency satisfied), R11 scrolling reviews
+   (P3.14, needs D15 and the R3 review-integrity work). The admin dark mode is the separate task P3.16.
 5. ~~**One full guarded regression pass (P2.2)**~~ — **all 17 suites green 2026-11-15**, including the
    `e2e-checkout.js` positive run (P2.3). The rest of the `tests/README.md` clean-up (P2.4).
 6. **Documentation (Phase 6):** READMEs (P6.2), runbook into the repo (P6.4), environment document (P6.5).
