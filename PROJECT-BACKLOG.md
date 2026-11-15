@@ -449,12 +449,13 @@ Dependencies & risks / Next action.
 - Dependencies & risks: none.
 - Next action: none.
 
-**P2.2 — Full regression after the 2026-11-13 → 11-14 changes** · *PARTIALLY COMPLETE*
+**P2.2 — Full regression after the 2026-11-13 → 11-14 changes** · *COMPLETE (Local)*
 - Required: every suite run once against the current code.
 - Exists:
   - **last full guarded regression: 2026-11-13** (817/817);
   - since then, T08, G-2, the maintenance fixes, R3, R4, QA-001, P3.4, G-8, G-9 and P3.1 landed;
-  - **2026-11-15 guarded pass, 16 of 17 database-backed suites green**, one at a time on
+  - **2026-11-15 guarded pass, all 17 database-backed suites green** (the 17th, `e2e-checkout.js`, 29/29 under
+    P2.3), one at a time on
     `nf_test_phase1_20261029` at 127.0.0.1:3308 (backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1):
     - eleven browser suites: 650/653 in the first pass. auth-e2e 28/30 → 30/30 on an unchanged re-run (15c/15d read
       the reset result after a fixed 2.5 s, before it had finished). offers-behaviour 41/44 twice → **44/44 twice**
@@ -464,20 +465,31 @@ Dependencies & risks / Next action.
     - the working `neofragrances` database identical before and after (counts, `CHECKSUM TABLE`, auto-increments);
       the test database changed only in auto-increments and in `updated_at` on the products payment-tests borrows
       (#14, #20, #21; stock unchanged).
-- Remains: `e2e-checkout.js`, the 17th suite (its positive run is P2.3, separate approval).
+- Remains: nothing locally.
 - Evidence: `tests/README.md` rows and its "Results 2026-11-15" note; section 8 of this file.
 - Dependencies & risks: the machine has little free RAM; run suites one at a time per the runbook. Browser checks
   that read a page after a fixed delay can fail under load (auth-e2e 15c/15d still does).
-- Next action: P2.3 (owner approval).
+- Next action: none locally; repeat the full guarded pass before any release (Phase 8).
 
-**P2.3 — `e2e-checkout.js` positive run** · *NEEDS VERIFICATION*
+**P2.3 — `e2e-checkout.js` positive run** · *COMPLETE (Local)*
 - Required: a full browser checkout end to end against the current harness.
-- Exists: the harness and refusal checks (Group 1, all passing 2026-10-24).
-- Remains: a positive run. The README says it was "not run against the current harness"; the last recorded
-  result, 26/29 (2026-10-30), predates the address-validation change.
-- Evidence: `tests/README.md`; session notes.
-- Dependencies & risks: separate approval; uses the Paystack test key.
-- Next action: owner approval.
+- Exists:
+  - the harness and refusal checks (Group 1, all passing 2026-10-24);
+  - **positive run 2026-11-15: 29/29, exit 0**, guarded on `nf_test_phase1_20261029` at 127.0.0.1:3308 (backend
+    `3975861`, frontend `a88a2b6`), Paystack mocked on 127.0.0.1:5099 with a fake `sk_test_mock` key (no real
+    Paystack calls); 36 expected stylesheet blocks, 0 unexpected;
+  - the callback page now shows the confirmed order, clears the bag and stays idempotent on reload — the three
+    checks that failed on 2026-10-30 (26/29), before the QA-001 fix (`77c3e8b`);
+  - the first 2026-11-15 run also passed 29/29 but exited 1: 12 blocked requests for the Google Fonts URL that
+    `css/style.css:16` loads with `@import` (in the frontend since 2026-08-23) were not on the expected list.
+    Nothing left the machine. Test-only fix `3975861` adds that exact URL; the storefront is unchanged.
+- Remains: nothing locally.
+- Evidence: `tests/README.md` (e2e-checkout row and harness section);
+  `NeoFragrances-DB-Validation\p23-e2e-checkout-rerun-20261115-102437\` (log, before/after snapshots). The working
+  `neofragrances` database was identical before and after; the test database changed only in auto-increments and
+  in `updated_at` on the borrowed fixture products #14 and #20 (stock restored, test order removed).
+- Dependencies & risks: the run is functional only (fonts and icons blocked); visual checks are separate.
+- Next action: none locally.
 
 **P2.4 — Stale rows in `tests/README.md`** · *PARTIALLY COMPLETE*
 - Required: every suite row shows its latest result.
@@ -1232,7 +1244,7 @@ Nothing here may be invented; each item waits for the owner.
 **Last full guarded regression: 2026-11-13** — 817/817 across all 17 database-backed suites (816/817 in the first pass; the one failure was a test expectation, corrected in `98bbaa5` and re-run 62/62), one at a time, on
 `nf_test_phase1_20261029` at 127.0.0.1:3308. The working database was unchanged.
 
-**P2.2 guarded pass, 2026-11-15 — 16 of 17 database-backed suites green** on the current code (T08, G-2, the
+**P2.2 guarded pass, 2026-11-15 — all 17 database-backed suites green** on the current code (T08, G-2, the
 maintenance fixes, R4, QA-001, P3.4, G-8, G-9 and P3.1 included), one at a time on `nf_test_phase1_20261029`;
 working database unchanged:
 
@@ -1254,6 +1266,7 @@ working database unchanged:
 | admin-api-tests | 112/112 |
 | platform-tests | 19/19 |
 | scent-family-tests | 77/77 |
+| e2e-checkout (P2.3) | 29/29, exit 0, after the expected-stylesheet fix `3975861` (first run 29/29, exit 1 on 12 unlisted font blocks) |
 
 Earlier re-runs between the two passes:
 
@@ -1269,8 +1282,8 @@ Earlier re-runs between the two passes:
 | Database-free (backend): admin-session 23, auth-rate-limit 51, security-headers 43, payment-reliability 79, payment-issues 84, password-session 33, startup-config 46, money-validation 11, maintenance-guard 22, email-normalisation 18, password-minimum 17; isolated-db-guard 29 | all pass | 2026-11-14 |
 | Frontend: maintenance-page 22, storefront-security-headers 34, admin-security-headers 29, admin-maintenance 30, admin-logout 14, admin-payment-issues 30 (one long-standing review observation), product-details-notes 13, password-minimum 14 | all pass | 2026-11-14 |
 
-Not run in their current form: `e2e-checkout.js` (P2.3). Per-suite detail: `tests/README.md` (some rows
-stale — P2.4).
+Every database-backed suite has now been run in its current form (`e2e-checkout.js` first on 2026-11-15, P2.3).
+Per-suite detail: `tests/README.md` (some rows stale — P2.4).
 
 ---
 
@@ -1289,8 +1302,8 @@ stale — P2.4).
 3. ~~**Fragrance Education integration (P3.1):** nav, footer, drawer and product-page links, plus the maceration
    section once the copy is approved.~~ — **done 2026-11-15** (frontend `a88a2b6`; P3.1 and P4.5 COMPLETE (Local)).
 4. **Dark mode (P3.3):** design decision, then a token-mapping plan for storefront and admin together, then implementation.
-5. ~~**One full guarded regression pass (P2.2)**~~ — **16 of 17 suites green 2026-11-15**; `e2e-checkout.js` remains
-   (P2.3, owner approval). The rest of the `tests/README.md` clean-up (P2.4).
+5. ~~**One full guarded regression pass (P2.2)**~~ — **all 17 suites green 2026-11-15**, including the
+   `e2e-checkout.js` positive run (P2.3). The rest of the `tests/README.md` clean-up (P2.4).
 6. **Documentation (Phase 6):** READMEs (P6.2), runbook into the repo (P6.4), environment document (P6.5).
 7. **Release decisions:** release path (P6.6), then the TiDB check (P5.2), then staging (P7.1–P7.4), then
    migrations on staging, then a production backup (P5.3), then Phase 8.

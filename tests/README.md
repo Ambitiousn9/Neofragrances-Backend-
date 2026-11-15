@@ -10,7 +10,7 @@ file is run on its own):
   `nf_test_*` test database: `admin-api-tests.js` (see "Isolated-database run of
   `admin-api-tests.js`"), `payment-tests.js` (see "Isolated-database run of
   `payment-tests.js`") and `e2e-checkout.js` (see "Isolated harness for
-  `e2e-checkout.js`" — not yet run in that form).
+  `e2e-checkout.js`" — first positive run in that form 2026-11-15, 29/29).
 - **Eleven database-free suites.** Nine load the real `server.js` with an in-memory fake
   `./db`: `auth-rate-limit-tests.js`, `security-headers-tests.js`,
   `payment-reliability-tests.js`, `payment-issues-tests.js`, `admin-session-tests.js`,
@@ -66,9 +66,10 @@ server-side admin logout) and migration 009 (applied locally on 2026-10-17). The
   outside the repo and run under a separate scratchpad guard, passed 68/68 against a
   restored scratch database. That was before the ADMIN-3 `server.js` change and before
   the in-repo file itself was guarded; it is not evidence for the current file.
-- **Not yet run:** no run of all twenty-three files. `e2e-checkout.js` has **not been
-  run** in its current, isolated-database form (see "Isolated harness for
-  `e2e-checkout.js`"), so its `payment_issues` cleanup has never been executed either.
+- **Not yet run:** no run of all twenty-three files in one pass. `e2e-checkout.js` was
+  first run in its current, isolated-database form on 2026-11-15 (29/29, see "Isolated
+  harness for `e2e-checkout.js`"); it created no `payment_issues` rows, so its
+  `payment_issues` cleanup has still had nothing to remove.
 
 **Test database server moved to port 3308 (2026-10-29).** Since 2026-10-27 the
 application's local data lives on a replacement MariaDB instance at `127.0.0.1:3308`; the
@@ -103,7 +104,7 @@ Previously: **614/614** (2026-10-04), across eleven suites, before
 | File | Covers | API port | CDP port | Last known green |
 |---|---|---|---|---|
 | `payment-tests.js` | Cart quote, Paystack initialize, `/api/payments/verify` integrity (amounts, signed metadata, idempotency, stock, coupons, offers), and the `POST /api/payments/webhook` signature + idempotency cases | 5055 | — | **74/74** (2026-11-15, P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1; Paystack mocked on 127.0.0.1:5099; as documented, it bumps `updated_at` on the products it borrows — #14, #20, #21 in the test database; stock unchanged). Earlier: 68/68 (2026-10-19; 0 failed, exit code 0 — one guarded run of the in-repo file against the isolated test database `nf_test_payment_20261019`, Paystack mocked on 127.0.0.1:5099; see "Isolated-database run of `payment-tests.js`" below. Earlier 68/68 figures were older-code runs) |
-| `e2e-checkout.js` | Cart → checkout → payment callback in headless Edge (functional only: the Google Fonts and Font Awesome stylesheets are blocked on purpose). Isolated test database only; see "Isolated harness for `e2e-checkout.js`" | 5055 (mock Paystack 5099) | 9334 | **Not run against the current harness.** 29/29 was recorded for the older version, which used the working database; it is not evidence for the current file |
+| `e2e-checkout.js` | Cart → checkout → payment callback in headless Edge (functional only: the Google Fonts and Font Awesome stylesheets are blocked on purpose). Isolated test database only; see "Isolated harness for `e2e-checkout.js`" | 5055 (mock Paystack 5099) | 9334 | **29/29** (2026-11-15, P2.3: first positive run of the current harness; isolated `nf_test_phase1_20261029` on 3308, guarded, mock Paystack on 127.0.0.1:5099; backend `3975861`, frontend `a88a2b6`; exit 0, 36 expected stylesheet blocks, 0 unexpected. The callback page shows the confirmed order, clears the bag and stays idempotent on reload — the three checks that failed on 2026-10-30 (26/29), before the QA-001 fix `77c3e8b`. The first 2026-11-15 run also passed 29/29 but exited 1 on 12 unexpected blocks: the Google Fonts URL that `css/style.css` loads with `@import` was missing from the expected list, added in `3975861`. Evidence: `NeoFragrances-DB-Validation\p23-e2e-checkout-rerun-20261115-102437\`). Earlier: 29/29 was recorded for the older version, which used the working database; it is not evidence for the current file |
 | `auth-e2e.js` | Register / verify / login / password reset (`DEV_EMAIL_LOG=true`, no Paystack, Google or SendGrid keys) | 5055 | 9336 | **30/30** (2026-11-15, P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1; the first run was 28/30 under load — 15c/15d read the reset result 2.5 s after submitting, before the reset had finished (old and new password both logged in, 200/200); an unchanged re-run passed 30/30). Earlier: 30/30 (2026-11-14, after G-9 password minimum: checks 14/14b now expect "at least 8", and 14c/14d were added — a 7-character password is refused in the register form and by the API; isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 28/28 (2026-11-14, after G-8 email normalisation: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 28/28 (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 28/28 |
 | `account-api-tests.js` | Milestone 4 account API + access control | 5056 | — | **50/50** (2026-11-15, P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1). Earlier: 50/50 (2026-11-14, after G-9 password minimum: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 50/50 (2026-11-14, after G-8 email normalisation: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 50/50 (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 49/49 |
 | `account-e2e.js` | Milestone 4 My Account pages in headless Edge | 5057 | 9337 | **61/61** (2026-11-15, P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1). Earlier: 61/61 (2026-11-14, after G-9 password minimum: isolated `nf_test_phase1_20261029` on 3308, guarded; the first run after G-9 was 59/61 under load — checks 2/2b read the overview while its counts still showed the loading placeholder; an unchanged re-run passed 61/61). Earlier: 61/61 (2026-11-14, after G-8 email normalisation: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 61/61 (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 61/61 |
@@ -391,12 +392,16 @@ Evidence (outside the repo): `C:\Users\Ambitous\NeoFragrances-DB-Backups\payment
 (run log, negative-case log, before/after snapshots, `SHA256SUMS.txt`) and
 `…\payment-db-reference-20261019\` (provisioning evidence and baseline).
 
-### Isolated harness for `e2e-checkout.js` (not yet run)
+### Isolated harness for `e2e-checkout.js`
 
-`e2e-checkout.js` now follows the same guard pattern as `payment-tests.js`. It has **not
-been run** in this form: there is no result, no negative-case evidence and no test
-database provisioned for it yet. Everything below describes the source, not observed
-behaviour. The header of the file shows the full launch line.
+`e2e-checkout.js` now follows the same guard pattern as `payment-tests.js`. **First positive
+run in this form: 2026-11-15, 29/29, exit 0** (P2.3), on `nf_test_phase1_20261029` at
+127.0.0.1:3308 with `OUT_DIR` and `EDGE_PROFILE_PARENT` under
+`NeoFragrances-DB-Validation\p23-e2e-checkout-rerun-20261115-102437\`. The order below was
+observed in that run's log (identity, mock, API server, Edge, interception, then fixtures);
+the working `neofragrances` database was identical before and after, and the test database
+changed only in auto-increments and in `updated_at` on the two borrowed fixture products
+(#14, #20; stock restored, test order removed). The header of the file shows the full launch line.
 
 - **Database.** It refuses to start unless the guard preload from this repo is active
   (`NODE_OPTIONS`, checked against the module cache), `NF_TEST_MODE=isolated`, `DB_NAME`
@@ -418,11 +423,12 @@ behaviour. The header of the file shows the full launch line.
 - **Browser isolation.** Every page request is intercepted. `localhost:5000` is rewritten
   to the isolated API, the storefront and the isolated API are allowed, and everything
   else is blocked. A response from port 5000 or a non-loopback address ends the run.
-- **Expected blocked stylesheets.** The tested pages link two outside stylesheets: the
-  Google Fonts `css2` URL for Fraunces + Inter and the cdnjs Font Awesome Free 6.5.1
-  `all.min.css`. Both are still **blocked**; a request matching one of those two exact
-  URLs, with `GET` and resource type `Stylesheet`, is counted as an expected block
-  instead of failing the run. Any other outside request — another host, path, query,
+- **Expected blocked stylesheets.** The tested pages load three outside stylesheets: the
+  Google Fonts `css2` URL for Fraunces + Inter from their `<link>` tags, the cdnjs Font
+  Awesome Free 6.5.1 `all.min.css`, and (since `3975861`) a second Google Fonts URL that
+  `css/style.css` pulls in with `@import` (the only source of Inter 700). All are still
+  **blocked**; a request matching one of those three exact URLs, with `GET` and resource
+  type `Stylesheet`, is counted as an expected block instead of failing the run. Any other outside request — another host, path, query,
   method or resource type — is an unexpected block and fails the run.
 - **Functional only.** With those stylesheets blocked, the pages render in fallback fonts
   and without icons. The run says so in its output. Its screenshots and its mobile
@@ -480,8 +486,8 @@ counts and checksums were identical too (only auto-increments advanced), no trig
 Results 2026-11-15 (P2.2 full regression), one at a time on `nf_test_phase1_20261029`: the
 eleven browser suites 650/653 in the first pass, then auth-e2e 30/30 on an unchanged re-run
 (15c/15d timing under load) and offers-behaviour 44/44 twice after the A19–A21 wait fix
-(`3aa2803`); the five API suites 332/332. So 16 of the 17 suites pass on the current code;
-`e2e-checkout.js` was not run (P2.3, separate approval). The working `neofragrances` database
+(`3aa2803`); the five API suites 332/332; and `e2e-checkout.js` 29/29 with exit 0 (P2.3) after
+the expected-stylesheet fix (`3975861`). So **all 17 suites pass on the current code**. The working `neofragrances` database
 was identical before and after each group (row counts, `CHECKSUM TABLE`, auto-increments). In
 the test database only auto-increments advanced, apart from `products`, whose checksum changed
 because payment-tests bumps `updated_at` on the products it borrows (#14, #20, #21; stock unchanged).
@@ -630,7 +636,8 @@ all use port **5055**, so starting one right after another fails with
   the isolated test database `nf_test_payment_20261019`: 6 `payment_issues` rows were
   created and all were removed (see its section). Earlier, a guarded copy kept outside
   the repo ran it once against a restored scratch database (Phase 3B.9D, 68/68). The
-  `e2e-checkout.js` cleanup has never run.
+  `e2e-checkout.js` run of 2026-11-15 created no `payment_issues` rows (auto-increment
+  unchanged), so its cleanup of that table has still had nothing to remove.
 - **Stage B changed two settlement responses** (deliberately; `server.js` `settlePayment`):
   a delivery address deleted after checkout used to fail the `orders.address_id` foreign
   key as a 500 `SETTLEMENT_ERROR` (and the webhook retried until Paystack gave up); it is
@@ -643,8 +650,8 @@ all use port **5055**, so starting one right after another fails with
   `payment-tests.js` and `e2e-checkout.js` still hold by inspection (their "failed"
   cases use a definitive Paystack `failed` status). `payment-tests.js` has since been
   re-run on the current code (68/68, 2026-10-19, isolated test database);
-  `e2e-checkout.js` now runs only against an isolated test database and has **not** been
-  run in that form.
+  `e2e-checkout.js` now runs only against an isolated test database and passed 29/29 in
+  that form on 2026-11-15 (its "failed payment" check passed).
 - Every suite checks that `DB_HOST` is `localhost`/`127.0.0.1` and exits otherwise.
   `account-controls-tests.js`, `maintenance-tests.js`,
   `order-status-history-tests.js` and `platform-tests.js` additionally require
