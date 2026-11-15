@@ -1,9 +1,9 @@
 // End-to-end checkout test: real frontend (http-server :5500) + real server.js (:5055, test env)
 // + mock Paystack (:5099) + headless Edge. Browser calls to localhost:5000 are rewritten to
-// :5055; every other non-local browser request is blocked and reported. Two exactly-listed
-// stylesheets (Google Fonts, Font Awesome) are expected blocks; any other block fails the run.
+// :5055; every other non-local browser request is blocked and reported. Three exactly-listed
+// stylesheets (two Google Fonts URLs, Font Awesome) are expected blocks; any other block fails the run.
 //
-// FUNCTIONAL-ONLY: with those two stylesheets blocked the pages render in fallback fonts and
+// FUNCTIONAL-ONLY: with those stylesheets blocked the pages render in fallback fonts and
 // without icons. Screenshots and the mobile overflow check do not establish visual fidelity.
 //
 // Runs ONLY under the isolated-database guard (tests/support/isolated-db-guard.js), against a
@@ -162,14 +162,17 @@ const API_ORIGIN = `http://127.0.0.1:${API_PORT}`;
 // reach are the storefront itself and the isolated API.
 const DEV_API_ORIGIN = "http://localhost:5000";
 const BROWSER_ALLOWED_ORIGINS = new Set([FRONT, API_ORIGIN]);
-// The two outside stylesheets every tested storefront page (index, about, cart,
-// payment-callback) links, copied from their <link> tags. They stay BLOCKED like every other
+// The outside stylesheets every tested storefront page (index, about, cart, payment-callback)
+// loads: the two copied from their <link> tags, plus the Google Fonts URL that css/style.css
+// pulls in with @import (line 16, in the repo since 2026-08-23; it differs from the <link> one
+// and is the only source of Inter 700). They stay BLOCKED like every other
 // outside request; a request matching one exactly — full URL, GET, resource type Stylesheet —
 // is only counted as expected instead of failing the run. Another path or query on the same
 // hosts, another method or another resource type is still an unexpected block. Compared as
 // WHATWG-serialised URLs (new URL().href) on both sides.
 const EXPECTED_BLOCKED_STYLESHEETS = new Set([
   "https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;1,9..144,400;1,9..144,500&family=Inter:wght@400;500;600&display=swap",
+  "https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;1,9..144,500&family=Inter:wght@400;500;600;700&display=swap",
   "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css",
 ].map(u => new URL(u).href));
 const FUNCTIONAL_ONLY_NOTICE = "FUNCTIONAL-ONLY RUN: the Google Fonts and Font Awesome stylesheets are blocked on purpose, so pages render in fallback fonts without icons. Screenshots and the mobile overflow check do not establish visual fidelity.";
