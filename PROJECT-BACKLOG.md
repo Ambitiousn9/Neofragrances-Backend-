@@ -569,9 +569,11 @@ Dependencies & risks / Next action.
 
 **P3.3 — Whole-site dark mode (storefront and admin)** · *NOT STARTED*
 - Required:
-  - a light/dark theme across the **entire storefront and the admin dashboard**;
+  - a light/dark theme across the **entire storefront, the customer account area (My Account and its
+    pages) and the admin dashboard**;
   - a user-accessible toggle;
-  - consistent behaviour in both areas (same preference, same tokens, no flash of the wrong theme);
+  - consistent behaviour in all three areas (same preference, same tokens, no flash of the wrong theme);
+  - readable text and consistent styling in both themes;
   - contrast meeting WCAG AA in both themes.
 - Exists: **no theme implementation anywhere**: no `prefers-color-scheme`, no `data-theme`, no toggle, no
   stored preference. Foundation:
@@ -587,6 +589,8 @@ Dependencies & risks / Next action.
     file before CSS.
 - Evidence: 2026-11-14 grep of all CSS, HTML and JS; per-file colour counts.
 - Dependencies & risks:
+  - **sequencing: planned for after T04** (P2.1, the isolated test-database guard, COMPLETE (Local)
+    2026-11-13), so the guarded suites can check the themed pages;
   - design decision (palette, toggle placement, default);
   - G-2 CSP (P1.3);
   - large surface for visual regressions.
@@ -732,10 +736,16 @@ Dependencies & risks / Next action.
 **P3.14 — SF-REV-01: continuously scrolling customer reviews (right to left)** · *NOT STARTED*
 - Required:
   - customer reviews scroll continuously from right to left;
-  - responsive at all widths;
+  - **every eligible genuine review can appear** in the moving display (it draws on all of them), rather than
+    permanently showing a small fixed selection;
+  - review text, customer attribution and rating stay readable;
+  - responsive at all widths, mobile and desktop, with no clipping and no horizontal page overflow;
+  - restrained movement (no excessive speed or motion);
   - reduced-motion support (no automatic movement when the visitor asks for reduced motion);
-  - pause on hover and keyboard focus, and duplicated copies hidden from assistive technology;
-  - **genuine reviews only**.
+  - an accessible pause control, as well as pause on hover and keyboard focus, and duplicated copies hidden
+    from assistive technology;
+  - empty review data handled gracefully (the section stays hidden, as today);
+  - **genuine reviews only**, taken from the existing review data; no fabricated or placeholder reviews.
 - Exists:
   - a homepage "Customer Reviews" section that shows up to 3 genuine reviews in a static grid and stays hidden
     when there are none (`index.html:158–167`, `js/home.js:22–23` and `:323+`, data from `GET /api/products/:id/reviews`);
@@ -743,6 +753,8 @@ Dependencies & risks / Next action.
     (`js/home.js:80–110`, `css/home.css:436–456`).
 - Remains:
   - the scrolling version;
+  - a way to load every eligible review (the current section shows at most 3) and a definition of "eligible"
+    (for example: visible, not hidden by moderation);
   - a rule for how many reviews are needed before it scrolls. Locally there is **1 visible review** (read-only
     `SELECT`, 2026-11-14), and a marquee would repeat it;
   - placement (homepage only, or also product pages).
@@ -756,9 +768,14 @@ Dependencies & risks / Next action.
 
 **P3.15 — ACCT-AV-01: customer profile-picture upload** · *NOT STARTED*
 - Required:
-  - customers can upload, preview, replace and remove a profile picture from My Account;
-  - **secure validation**: allowed image types checked by content, not just extension; size and dimension
-    limits; re-encoding or metadata stripping; owner-only access;
+  - customers can upload a profile picture, preview it before saving, change or replace it, and remove it, from
+    My Account;
+  - a sensible fallback (a default avatar or the customer's initials) when no picture is set;
+  - **secure validation**: allowed image types checked by content, not just extension; file-size and dimension
+    limits; re-encoding or metadata stripping;
+  - **owner-only access**: a customer can manage only their own picture;
+  - images stored and served safely (no user-controlled file names or paths, correct content type);
+  - responsive display on every account page that shows the picture;
   - **durable storage**.
 - Exists:
   - nothing for uploads: the `users` table has no picture column (columns: id, full_name, email, google_id,
