@@ -179,9 +179,14 @@ const n = v => Number(v) || 0;
 
     /* ---------- A19-A25: storefront, live state ---------- */
     await go(`${FRONT}/special-offers.html`);
-    await sleep(2000);
+    // offers.js renders only after productsReady (the whole catalogue) and then /api/offers/active, which
+    // took up to ~11 s after navigation on the test machine (2026-11-15), so wait for the render itself, as
+    // A23 does for prices: the featured banner exists, or the no-offers state is shown (fetch failed or
+    // nothing live). Bounded at 15 s; the assertions below are unchanged.
+    const offersRendered = await waitFor(`!!document.querySelector("#featured-offer-wrap .featured-offer-banner") || getComputedStyle(document.getElementById("no-offers-banner")).display !== "none"`, 15000);
     let txt = await pageText();
-    check("A19. special-offers featured banner shows oLive's title", txt.includes(T_LIVE), txt.slice(0, 120).replace(/\n/g, " | "));
+    check("A19. special-offers featured banner shows oLive's title", txt.includes(T_LIVE),
+      (offersRendered ? "" : "offers never rendered within 15s; page read: ") + txt.slice(0, 120).replace(/\n/g, " | "));
     check("A20. featured banner shows GH₵500.00, GH₵400.00 and SAVE 20%", txt.includes("GH₵500.00") && txt.includes("GH₵400.00") && /SAVE\s*20%/.test(txt));
     check("A21. special-offers page shows PX (the live offer's product)", txt.includes(PX_NAME));
     check("A22. special-offers page does NOT show PY (expired/scheduled/disabled only)", !txt.includes(PY_NAME));
