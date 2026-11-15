@@ -408,11 +408,12 @@ changed only in auto-increments and in `updated_at` on the two borrowed fixture 
 - **Browser isolation.** Every page request is intercepted. `localhost:5000` is rewritten
   to the isolated API, the storefront and the isolated API are allowed, and everything
   else is blocked. A response from port 5000 or a non-loopback address ends the run.
-- **Expected blocked stylesheets.** The tested pages load three outside stylesheets: the
-  Google Fonts `css2` URL for Fraunces + Inter from their `<link>` tags, the cdnjs Font
-  Awesome Free 6.5.1 `all.min.css`, and (since `3975861`) a second Google Fonts URL that
-  `css/style.css` pulls in with `@import` (the only source of Inter 700). All are still
-  **blocked**; a request matching one of those three exact URLs, with `GET` and resource
+- **Expected blocked stylesheets.** The tested pages load two outside stylesheets: the
+  Google Fonts `css2` URL for Fraunces + Inter (including Inter 700) from their `<link>` tags,
+  and the cdnjs Font Awesome Free 6.5.1 `all.min.css`. (From `3975861` until frontend R6 there
+  was a third, the second Google Fonts URL that `css/style.css` pulled in with `@import`; R6
+  removed the `@import` and added Inter 700 to the `<link>`.) Both are still
+  **blocked**; a request matching one of those exact URLs, with `GET` and resource
   type `Stylesheet`, is counted as an expected block instead of failing the run. Any other outside request — another host, path, query,
   method or resource type — is an unexpected block and fails the run.
 - **Functional only.** With those stylesheets blocked, the pages render in fallback fonts
