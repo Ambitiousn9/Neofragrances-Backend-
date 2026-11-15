@@ -365,7 +365,8 @@ Dependencies & risks / Next action.
   - all DB-free and frontend suites green; `_headers` CSP hashes unaffected (inline scripts unchanged).
 - Dependencies & risks: none known. Existing short passwords are not forced to change; that would be a separate
   decision.
-- Next action: none locally; include in the P2.2 full regression.
+- Next action: none locally. Included in the P2.2 guarded pass of 2026-11-15 (auth-e2e 30/30, account-api 50/50,
+  account-e2e 61/61, account-controls 87/87).
 
 **P1.13 — G-4: rate limits and `trust proxy` behind Render** · *NEEDS VERIFICATION*
 - Required: client IPs are read correctly behind Render's proxy; limits behave on the real host.
@@ -542,27 +543,39 @@ Dependencies & risks / Next action.
 ### Phase 3 — Storefront improvements
 *Objective: a complete, honest, accessible storefront and admin experience.*
 
-**P3.1 — Fragrance Education: integrate `learn.html` into the storefront** · *PARTIALLY COMPLETE (Local)*
+**P3.1 — Fragrance Education: integrate `learn.html` into the storefront** · *COMPLETE (Local)*
 - Required: customers can find and use the Fragrance Guide from the storefront; product pages link to
   relevant guide terms; the guide covers maceration.
 - Exists:
-  - `learn.html` (542 lines, approved British-English copy, sections: notes, concentrations, families,
+  - `learn.html` (559 lines, approved British-English copy, sections: notes, concentrations, families,
     wear-care, glossary);
-  - `css/learn.css` (313 lines);
+  - `css/learn.css` (322 lines);
   - licensed images in `images/guide/` with `CREDITS.md`;
-  - committed since `4632f0d` (also `18403c2`).
-- Remains:
-  - **links from the storefront nav, footer and mobile drawer: none exist** (no other page references `learn.html`);
-  - **glossary links from product pages: none exist**;
-  - **maceration section: not present** (zero mentions in `learn.html`);
-  - a browser and CSP check after integration (the `learn.html` inline-script hash is in `_headers`).
-- Evidence: 2026-11-14 grep across all pages and JS (0 references); `learn.html` content check.
-- Dependencies & risks:
-  - approved maceration copy (section 7);
-  - nav label and placement decision;
-  - any edit to the inline script needs a new CSP hash.
-- Next action: owner approves placement and maceration copy, then implement.
-- **Not complete. Do not mark it complete until it is linked, checked and the maceration section is added.**
+  - committed since `4632f0d` (also `18403c2`);
+  - **integration committed in frontend `a88a2b6` (2026-11-15), pushed to `rebuild`:**
+    - **links:** "Fragrance Guide" (owner-approved label and placement, D5) in the main nav after Offers
+      (highlighted on `learn.html`), the footer Customer Care list after FAQ and the mobile drawer's Shop section
+      (`js/layout.js`, `js/mobile-drawer.js`); nav labels stay on one line down to the 960px drawer breakpoint
+      (`css/layout.css`);
+    - **product-page glossary links:** the Concentration value (EDP/EDT/EDC) and the Top/Heart/Base Notes headings
+      link to `learn.html#term-…` (`product-details.html`, `.pd-guide-link` in `css/style.css`); new product-page
+      CSP hash in all 50 `_headers` rules, no other policy change;
+    - **maceration section:** the owner-approved copy (`#maceration` in Wear & care) with the owner's original
+      maceration card (`images/guide/guide-maceration.jpg`, 818 × 1024, shown whole at 4:5, at most 440px; two words
+      corrected to British spelling, original kept outside the repo) and a Maceration glossary entry before Musk;
+      `CREDITS.md` records the card as the owner's original artwork.
+- Remains: nothing in the requirements above. Not verified on Netlify or on a phone (P0.6 LAN/iPhone check,
+  P2.5 staging).
+- Evidence:
+  - frontend suites 186/186 (storefront CSP 34/34);
+  - real-browser checks under the real `_headers` CSP: nav, footer, drawer and product-page links 17/17;
+    the maceration section at 1366px and 390px 22/22 (image whole and undistorted, glossary and direct anchors land
+    below the sticky header, no overflow, CSP violations or console errors);
+  - P2.2 guarded pass 2026-11-15 with `a88a2b6` served: all eleven browser suites green (see P2.2).
+- Dependencies & risks: any later edit to an inline script (product page, `learn.html`) needs a new CSP hash.
+- Next action: none locally. Production needs the frontend release (P6.6, Phase 7).
+- Marked COMPLETE (Local) on 2026-11-15 at the owner's instruction: linked, checked and the maceration section
+  added.
 
 **P3.2 — Fragrance Education CMS (old backlog 15a)** · *NOT STARTED (deferred, not cancelled)*
 - Required: admin-managed, database-driven articles (draft/publish, categories, featured, sanitised
@@ -628,10 +641,10 @@ Dependencies & risks / Next action.
   - other frontend suites green: storefront-security-headers 34/34, admin-security-headers 29/29,
     maintenance-page 22/22, admin-maintenance 30/30, admin-logout 14/14, admin-payment-issues 30/30;
   - read-only `SELECT` (2026-11-14): 15 active products have `???` notes, 145 `—`.
-- Dependencies & risks: the guarded backend browser suites that open product pages (`restore-app-verify`,
-  `scent-family-storefront-e2e`) were not re-run after this change (part of P2.2). Any later edit to the product
-  page's inline script needs a new CSP hash.
-- Next action: none for P3.4; include in the P2.2 full regression.
+- Dependencies & risks: any later edit to the product page's inline script needs a new CSP hash. The guarded
+  backend browser suites that open product pages were re-run in the P2.2 pass of 2026-11-15
+  (`restore-app-verify` 34/34, `scent-family-storefront-e2e` 62/62).
+- Next action: none for P3.4.
 
 **P3.5 — Generated product descriptions are not verified information** · *NOT STARTED*
 - Required: no invented product claims on the product page.
@@ -849,13 +862,15 @@ Dependencies & risks / Next action.
 - Dependencies & risks: owner browser checks of reference sites.
 - Next action: owner approves the next batch.
 
-**P4.5 — Fragrance Guide maceration section** · *NOT STARTED*
+**P4.5 — Fragrance Guide maceration section** · *COMPLETE (Local)*
 - Required: an owner-approved maceration section in `learn.html`.
-- Exists: nothing (zero mentions).
-- Remains: copy, then implementation (part of P3.1).
-- Evidence: 2026-11-14 grep.
-- Dependencies & risks: owner copy; CSP hash if the inline script changes.
-- Next action: owner supplies or approves the copy.
+- Exists: the owner-approved copy (`#maceration` in Wear & care, "Maceration: The art of letting a fragrance
+  rest"), the owner's original maceration card and a Maceration glossary entry; committed in frontend `a88a2b6`
+  (2026-11-15) as part of P3.1.
+- Remains: nothing locally.
+- Evidence: P3.1 (maceration browser check 22/22 at 1366px and 390px; frontend suites 186/186).
+- Dependencies & risks: none; the inline script was not changed, so no new `learn.html` CSP hash was needed.
+- Next action: none locally.
 
 **P4.6 — Brand-name normalisation** · *NOT STARTED*
 - Required: one spelling per brand.
@@ -1171,7 +1186,7 @@ Dependencies & risks / Next action.
 | D2 | Read-only production TiDB version check (P5.2) | P5.1 migrations | Owner approval |
 | D3 | Staging hosts (P7.1) | P2.5, P7.x, P8.5 | Owner |
 | D4 | Dark-mode design: palette, toggle placement, default, CSP approach (P3.3) | P3.3 | Owner |
-| D5 | Fragrance Guide placement and nav label (P3.1) | P3.1 | Owner |
+| D5 | ~~Fragrance Guide placement and nav label (P3.1)~~ — **resolved**: the owner approved "Fragrance Guide" in the main nav, footer and mobile drawer; implemented in `a88a2b6` | — | — |
 | D6 | What to show instead of generated descriptions (P3.5) | P3.5 | Owner |
 | D7 | Off-machine backup destination (P0.3) | P0.3 | Owner |
 | D8 | Security choices: G-5 fail-open (P1.14), G-10 enumeration (P1.15), password minimum (P1.12) | Those tasks | Owner |
@@ -1180,7 +1195,7 @@ Dependencies & risks / Next action.
 | D11 | Production data release for local-only data (P5.5) | P5.5 | Owner |
 | D12 | Migration ledger approach (P5.4) | P5.4 | Owner |
 | D13 | Brand-name spelling (P4.6) | P4.6 | Owner |
-| B1 | Owner content (section 7) | P4.x, P3.1, P3.6 | Owner |
+| B1 | Owner content (section 7) | P4.x, P3.6 | Owner |
 | B2 | Single-disk backups (P0.3) | Data safety | — |
 | D14 | Image storage for uploads (admin product images P3.13, customer profile pictures P3.15) | P3.13 image upload, P3.15 | Owner |
 | D15 | Scrolling reviews: minimum genuine-review count and placement (P3.14) | P3.14 | Owner |
@@ -1201,7 +1216,8 @@ Nothing here may be invented; each item waits for the owner.
 - **Hero image licence** (`images/hero/hero-banner.jpg`) (P3.7).
 - **Product descriptions and fragrance notes** (P4.3).
 - **Scent-family research** — owner browser checks of reference sites; batch 2 approval (P4.4).
-- **Maceration copy** for the Fragrance Guide (P4.5).
+- ~~**Maceration copy** for the Fragrance Guide (P4.5).~~ — **supplied and approved 2026-11-14**, with the owner's
+  original maceration card; added in `a88a2b6` (P3.1, P4.5).
 - **Dark-mode design choices** (D4).
 - **Scrolling-reviews rules** — minimum genuine-review count and placement (D15, P3.14).
 - **Image-storage choice** for admin and customer uploads (D14, P3.13, P3.15).
@@ -1266,12 +1282,12 @@ stale — P2.4).
    - ~~investigate QA-001, the missing payment callback page (P2.6)~~ — **done 2026-11-14**: fixed in `77c3e8b`,
      verified with order #527.
 2. **Small, safe code fixes** (each needs approval):
-   - the product-details `???` notes bug (P3.4);
+   - ~~the product-details `???` notes bug (P3.4)~~ — **done 2026-11-14** (`670d75b`);
    - ~~email normalisation, G-8 (P1.11)~~ — **done 2026-11-14** (`43e3427`, `406d9a1`);
    - ~~the password minimum, G-9 (P1.12)~~ — **done 2026-11-14**, minimum 8 (`dfc6ccd`, `d60f0ef`);
    - ~~stale 009 comments (P6.7)~~ — **done 2026-11-14** (`ff5a9f4`).
-3. **Fragrance Education integration (P3.1):** nav, footer, drawer and product-page links, plus the maceration
-   section once the copy is approved.
+3. ~~**Fragrance Education integration (P3.1):** nav, footer, drawer and product-page links, plus the maceration
+   section once the copy is approved.~~ — **done 2026-11-15** (frontend `a88a2b6`; P3.1 and P4.5 COMPLETE (Local)).
 4. **Dark mode (P3.3):** design decision, then a token-mapping plan for storefront and admin together, then implementation.
 5. ~~**One full guarded regression pass (P2.2)**~~ — **16 of 17 suites green 2026-11-15**; `e2e-checkout.js` remains
    (P2.3, owner approval). The rest of the `tests/README.md` clean-up (P2.4).
@@ -1318,3 +1334,5 @@ stale — P2.4).
   (`2751520`), G-2 (`bac4433`), T08 (`e45479b`).
 - **Phase 2 maintenance work (2026-11-14):** guard case fix (`1143177`), harness fix (`afbbe8a`), R4 maintenance
   auto-return (`8234289`), R3 `HEAD /api/health` (`660176a`).
+- **Fragrance Guide integration (2026-11-15):** P3.1 and P4.5 — nav, footer and drawer links, product-page
+  glossary links and the maceration section (frontend `a88a2b6`).
