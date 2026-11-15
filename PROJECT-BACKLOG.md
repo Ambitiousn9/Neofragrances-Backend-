@@ -7,8 +7,9 @@ Master backlog for the rebuild. Covers both repositories:
 - `neofragrances-frontend` — static storefront + admin portal (Netlify).
 - `neofragrances-server` — Express 5 API + MariaDB/TiDB (Render, TiDB Cloud). This file lives here.
 
-**Last updated: 2026-11-14**, from the read-only project audit of 14 November 2026. Every status below
-cites the evidence that audit found (commit, file:line, test name and result, or database query). Where the
+**Last updated: 2026-11-15.** Built from the read-only project audit of 14 November 2026 and updated since
+as work landed (most recently P3.1, P4.5 and the P2.2–P2.4 regression results on 2026-11-15). Every status
+below cites its evidence (commit, file:line, test name and result, or database query). Where the
 evidence was not sufficient, the task says **NEEDS VERIFICATION** rather than guessing. The previous version
 of this file (last edited 2026-10-02, commit `4cc0ef6`) is summarised in the archive at the end.
 
