@@ -491,16 +491,25 @@ Dependencies & risks / Next action.
 - Dependencies & risks: the run is functional only (fonts and icons blocked); visual checks are separate.
 - Next action: none locally.
 
-**P2.4 — Stale rows in `tests/README.md`** · *PARTIALLY COMPLETE*
+**P2.4 — Stale rows in `tests/README.md`** · *COMPLETE (Local)*
 - Required: every suite row shows its latest result.
-- Exists: most rows were updated on 2026-11-13 and 11-14.
-- Remains:
-  - ~~payment-tests shows 68/68 (session notes: 74/74 on 10-30)~~ — **updated 2026-11-15**: 74/74 (P2.2);
-  - payment-reliability-tests shows 66/66 (actual 71/71, 2026-11-14);
-  - auth-rate-limit-tests is dated 2026-10-17.
-- Evidence: 2026-11-14 audit.
-- Dependencies & risks: none.
-- Next action: a documentation pass (separate approval; this task only changes PROJECT-BACKLOG.md).
+- Exists:
+  - **all 29 suite rows lead with a 2026-11-15 result**: the 17 database-backed suites from P2.2/P2.3, and the
+    12 database-free suites and guard self-test re-run for P2.4 on backend `c331501` (456/456, all exit 0:
+    auth-rate-limit 51, security-headers 43, payment-reliability 79, payment-issues 84, admin-session 23,
+    password-session 33, startup-config 46, money-validation 11, maintenance-guard 22, email-normalisation 18,
+    password-minimum 17, isolated-db-guard 29);
+  - the items this entry listed were resolved: payment-tests 74/74 (P2.2); payment-reliability-tests and
+    auth-rate-limit-tests already showed 79/79 and 51/51 (2026-11-14) and now show the 2026-11-15 re-run;
+  - the README's opening list now gives 29 files and says all 17 database-backed suites are guarded (it said 23
+    files, with 14 suites on the working database).
+- Remains: nothing for the rows. The README's "Aggregate status" and "Status against the current code"
+  paragraphs still describe October results and are not yet rewritten.
+- Evidence: `tests/README.md` rows; P2.2, P2.3.
+- Dependencies & risks: nine of the database-free suites loaded `.env` on 2026-11-15 (run with nothing set, as
+  documented); their own values (`DB_PORT=1`, fake keys) take precedence, so no database or outside service was
+  reachable.
+- Next action: none for the rows.
 
 **P2.5 — Staging and Netlify tests** · *BLOCKED*
 - Required: header, CORS, OAuth, webhook and time-zone checks on a real deployment.
