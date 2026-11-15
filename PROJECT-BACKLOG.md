@@ -448,16 +448,26 @@ Dependencies & risks / Next action.
 - Dependencies & risks: none.
 - Next action: none.
 
-**P2.2 — Full regression after the 2026-11-13 → 11-14 changes** · *NOT STARTED*
+**P2.2 — Full regression after the 2026-11-13 → 11-14 changes** · *PARTIALLY COMPLETE*
 - Required: every suite run once against the current code.
 - Exists:
   - **last full guarded regression: 2026-11-13** (817/817);
-  - since then, T08, G-2, the maintenance fixes, R3 and R4 landed;
-  - only admin-api-tests 112/112, maintenance-tests 85/85, the nine database-free suites and the six frontend suites were re-run.
-- Remains: a complete guarded pass of all 17 database-backed suites, one at a time.
-- Evidence: `tests/README.md` rows; section 8 of this file.
-- Dependencies & risks: the machine has little free RAM; run suites one at a time per the runbook.
-- Next action: owner approval for one full guarded pass.
+  - since then, T08, G-2, the maintenance fixes, R3, R4, QA-001, P3.4, G-8, G-9 and P3.1 landed;
+  - **2026-11-15 guarded pass, 16 of 17 database-backed suites green**, one at a time on
+    `nf_test_phase1_20261029` at 127.0.0.1:3308 (backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1):
+    - eleven browser suites: 650/653 in the first pass. auth-e2e 28/30 → 30/30 on an unchanged re-run (15c/15d read
+      the reset result after a fixed 2.5 s, before it had finished). offers-behaviour 41/44 twice → **44/44 twice**
+      after the test fix `3aa2803` (A19–A21 now wait for the special-offers render instead of a fixed 2 s; the page
+      renders only after the whole catalogue loads, up to ~11 s here; assertions unchanged; not a storefront defect);
+    - five API suites: 332/332 (payment 74, account-api 50, admin-api 112, platform 19, scent-family 77);
+    - the working `neofragrances` database identical before and after (counts, `CHECKSUM TABLE`, auto-increments);
+      the test database changed only in auto-increments and in `updated_at` on the products payment-tests borrows
+      (#14, #20, #21; stock unchanged).
+- Remains: `e2e-checkout.js`, the 17th suite (its positive run is P2.3, separate approval).
+- Evidence: `tests/README.md` rows and its "Results 2026-11-15" note; section 8 of this file.
+- Dependencies & risks: the machine has little free RAM; run suites one at a time per the runbook. Browser checks
+  that read a page after a fixed delay can fail under load (auth-e2e 15c/15d still does).
+- Next action: P2.3 (owner approval).
 
 **P2.3 — `e2e-checkout.js` positive run** · *NEEDS VERIFICATION*
 - Required: a full browser checkout end to end against the current harness.
@@ -472,7 +482,7 @@ Dependencies & risks / Next action.
 - Required: every suite row shows its latest result.
 - Exists: most rows were updated on 2026-11-13 and 11-14.
 - Remains:
-  - payment-tests shows 68/68 (session notes: 74/74 on 10-30);
+  - ~~payment-tests shows 68/68 (session notes: 74/74 on 10-30)~~ — **updated 2026-11-15**: 74/74 (P2.2);
   - payment-reliability-tests shows 66/66 (actual 71/71, 2026-11-14);
   - auth-rate-limit-tests is dated 2026-10-17.
 - Evidence: 2026-11-14 audit.
@@ -1206,11 +1216,30 @@ Nothing here may be invented; each item waits for the owner.
 **Last full guarded regression: 2026-11-13** — 817/817 across all 17 database-backed suites (816/817 in the first pass; the one failure was a test expectation, corrected in `98bbaa5` and re-run 62/62), one at a time, on
 `nf_test_phase1_20261029` at 127.0.0.1:3308. The working database was unchanged.
 
-**Changes since then still need a full pass (P2.2):** T08 (`e45479b`), G-2 (`bac4433`), the maintenance fixes
-(`1143177`, `afbbe8a`, `660176a`), R4 (`8234289`), QA-001 (`77c3e8b`), P3.4 (`670d75b`), G-8 (`43e3427`, `406d9a1`)
-and G-9 (`dfc6ccd`, `d60f0ef`).
+**P2.2 guarded pass, 2026-11-15 — 16 of 17 database-backed suites green** on the current code (T08, G-2, the
+maintenance fixes, R4, QA-001, P3.4, G-8, G-9 and P3.1 included), one at a time on `nf_test_phase1_20261029`;
+working database unchanged:
 
-Re-run since the full pass:
+| Suite | Result |
+|---|---|
+| auth-e2e | 30/30 (first run 28/30, 15c/15d timing; unchanged re-run) |
+| account-e2e | 61/61 |
+| admin-e2e | 98/98 |
+| restore-app-verify | 34/34 |
+| offers-behaviour | 44/44 twice, after the A19–A21 wait fix `3aa2803` (41/44 twice before it) |
+| maintenance-tests | 85/85 |
+| account-controls-tests | 87/87 |
+| order-status-history-tests | 92/92 |
+| offers-multi-product-tests | 127/127 |
+| scent-family-admin-e2e | 47/47 |
+| scent-family-storefront-e2e | 62/62 |
+| payment-tests | 74/74 |
+| account-api-tests | 50/50 |
+| admin-api-tests | 112/112 |
+| platform-tests | 19/19 |
+| scent-family-tests | 77/77 |
+
+Earlier re-runs between the two passes:
 
 | Suite | Result | Date |
 |---|---|---|
@@ -1244,7 +1273,8 @@ stale — P2.4).
 3. **Fragrance Education integration (P3.1):** nav, footer, drawer and product-page links, plus the maceration
    section once the copy is approved.
 4. **Dark mode (P3.3):** design decision, then a token-mapping plan for storefront and admin together, then implementation.
-5. **One full guarded regression pass (P2.2)** and the `tests/README.md` clean-up (P2.4).
+5. ~~**One full guarded regression pass (P2.2)**~~ — **16 of 17 suites green 2026-11-15**; `e2e-checkout.js` remains
+   (P2.3, owner approval). The rest of the `tests/README.md` clean-up (P2.4).
 6. **Documentation (Phase 6):** READMEs (P6.2), runbook into the repo (P6.4), environment document (P6.5).
 7. **Release decisions:** release path (P6.6), then the TiDB check (P5.2), then staging (P7.1–P7.4), then
    migrations on staging, then a production backup (P5.3), then Phase 8.
