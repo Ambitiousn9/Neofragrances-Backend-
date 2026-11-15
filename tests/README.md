@@ -20,56 +20,41 @@ file is run on its own):
 - **One guard self-test**, `isolated-db-guard-tests.js`, which starts no `server.js`
   and opens no database connection.
 
-**Run the whole set, not just the eight in the table's original form.** The table
-below lists all twenty-three; `platform-tests.js`, `offers-behaviour.js`,
-`maintenance-tests.js`, `account-controls-tests.js`,
-`order-status-history-tests.js`, `offers-multi-product-tests.js`,
-`scent-family-tests.js`, `scent-family-admin-e2e.js`,
-`scent-family-storefront-e2e.js`, `auth-rate-limit-tests.js`,
-`security-headers-tests.js`, `payment-reliability-tests.js`,
-`payment-issues-tests.js`, `admin-session-tests.js` and `isolated-db-guard-tests.js`
-were added after the original eight and are easy to miss.
+**Run the whole set.** The table below lists all twenty-nine files. It is easy to run
+only the database-backed suites and forget the twelve database-free ones (including
+the guard self-test), or the reverse; a regression pass needs both groups.
 
-**Aggregate status.** The last complete run recorded in this file is **925/925** across
-the **fourteen** suites that existed on 2026-10-09 (Milestone 6 Phase 6E), with
-`offers-multi-product-tests.js` passing 127/127. There are now **twenty-three** test
-files. The nine added since — `scent-family-tests.js`, `scent-family-admin-e2e.js`,
-`scent-family-storefront-e2e.js`, `auth-rate-limit-tests.js`, `security-headers-tests.js`,
-`payment-reliability-tests.js`, `payment-issues-tests.js`, `admin-session-tests.js` and
-`isolated-db-guard-tests.js` — have focused results only, shown per row in the table
-below with their dates. No run of all twenty-three is recorded here, so the per-suite
-figures must not be added up as if they were one run.
+**Aggregate status (2026-11-15).** Every one of the twenty-nine files passed on
+2026-11-15 against the current application code: backend application files unchanged
+since `ff5a9f4` (2026-11-14, comment-only) and frontend `a88a2b6` (with P3.1). The
+groups ran separately, one suite at a time, on the same day:
 
-**Status against the current code.** Several changes landed after most of the
-database-backed results were recorded: payment reliability Stage A and Stage B, login /
-registration rate limiting, API security headers, ADMIN-3 (12-hour admin tokens and
-server-side admin logout) and migration 009 (applied locally on 2026-10-17). The last
-`server.js` change was on 2026-10-17. Against that code:
+- the seventeen database-backed suites, guarded on `nf_test_phase1_20261029` at
+  127.0.0.1:3308 (P2.2/P2.3): 1,128 checks — eleven browser suites 767, five API suites
+  332, `e2e-checkout.js` 29;
+- the eleven database-free suites and `isolated-db-guard-tests.js` (P2.4): 456 checks.
 
-- **Passed:** `admin-api-tests.js` 108/108 (ADMIN-5F, isolated test database, saved run
-  log), and 108/108 again on 2026-10-19 with the Option 2B pre-spawn check in place
-  (see "Option 2B runtime verification" below). `payment-tests.js` 68/68 on 2026-10-19:
-  one guarded run of the in-repo file against the isolated test database
-  `nf_test_payment_20261019`, with Paystack mocked (see "Isolated-database run of
-  `payment-tests.js`"). The five database-free suites passed on 2026-10-17 after the last `server.js`
-  change (`payment-issues-tests.js` 84/84, `payment-reliability-tests.js` 66/66,
-  `auth-rate-limit-tests.js` 51/51, `security-headers-tests.js` 41/41,
-  `admin-session-tests.js` 23/23), with run logs saved outside the repo.
-  `isolated-db-guard-tests.js` 28/28 is recorded in the session transcript only; no run
-  log was saved.
-- **Safely aborted:** the first controlled run of `admin-api-tests.js` (ADMIN-5E). See
-  its section below.
-- **Older-code results only:** the other fifteen database-backed suites. Their last
-  passes predate some or all of the changes listed above, and they have **not all been
-  re-run** since. Their figures in the table are not evidence for the current code.
-- **Historical:** on 2026-10-17 (Phase 3B.9D) a modified copy of `payment-tests.js`, kept
-  outside the repo and run under a separate scratchpad guard, passed 68/68 against a
-  restored scratch database. That was before the ADMIN-3 `server.js` change and before
-  the in-repo file itself was guarded; it is not evidence for the current file.
-- **Not yet run:** no run of all twenty-three files in one pass. `e2e-checkout.js` was
-  first run in its current, isolated-database form on 2026-11-15 (29/29, see "Isolated
-  harness for `e2e-checkout.js`"); it created no `payment_issues` rows, so its
-  `payment_issues` cleanup has still had nothing to remove.
+Three results needed more than one run, and only test files changed in between: the
+first browser pass was 762/767 (auth-e2e 15c/15d timing under load, passed 30/30 on an
+unchanged re-run; offers-behaviour A19–A21, fixed in the test by `3aa2803` and then
+44/44 twice), and `e2e-checkout.js` passed 29/29 but exited 1 until its expected-
+stylesheet list was fixed in `3975861`. Because the groups were separate runs, the
+counts are a set of same-day results, not one combined run. The working `neofragrances`
+database was identical before and after every database-backed group.
+
+**Earlier record (history).** The previous complete record was **817/817** across the
+seventeen database-backed suites on 2026-11-13 (T04, see "Isolated runs of the fourteen
+converted suites"), and before that **925/925** across the fourteen suites that existed
+on 2026-10-09 (Milestone 6 Phase 6E). Results in the sections below that predate
+2026-11-15 describe older code; the table's first figure in each row is the current one.
+Two runs of `admin-api-tests.js` from October are kept below for their method: the
+safely aborted first controlled run (ADMIN-5E) and the Option 2B runtime verification.
+On 2026-10-17 (Phase 3B.9D) a modified copy of `payment-tests.js`, kept outside the repo
+under a separate scratchpad guard, passed 68/68 against a restored scratch database;
+that is not evidence for the in-repo file.
+
+`e2e-checkout.js` created no `payment_issues` rows in its 2026-11-15 run, so its
+`payment_issues` cleanup has still had nothing to remove.
 
 **Test database server moved to port 3308 (2026-10-29).** Since 2026-10-27 the
 application's local data lives on a replacement MariaDB instance at `127.0.0.1:3308`; the
@@ -484,7 +469,7 @@ after (row counts, `CHECKSUM TABLE` of all 16 tables, auto-increments); the test
 counts and checksums were identical too (only auto-increments advanced), no triggers left.
 
 Results 2026-11-15 (P2.2 full regression), one at a time on `nf_test_phase1_20261029`: the
-eleven browser suites 650/653 in the first pass, then auth-e2e 30/30 on an unchanged re-run
+eleven browser suites 762/767 in the first pass, then auth-e2e 30/30 on an unchanged re-run
 (15c/15d timing under load) and offers-behaviour 44/44 twice after the A19–A21 wait fix
 (`3aa2803`); the five API suites 332/332; and `e2e-checkout.js` 29/29 with exit 0 (P2.3) after
 the expected-stylesheet fix (`3975861`). So **all 17 suites pass on the current code**. The working `neofragrances` database

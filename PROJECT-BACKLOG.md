@@ -457,7 +457,7 @@ Dependencies & risks / Next action.
   - **2026-11-15 guarded pass, all 17 database-backed suites green** (the 17th, `e2e-checkout.js`, 29/29 under
     P2.3), one at a time on
     `nf_test_phase1_20261029` at 127.0.0.1:3308 (backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1):
-    - eleven browser suites: 650/653 in the first pass. auth-e2e 28/30 → 30/30 on an unchanged re-run (15c/15d read
+    - eleven browser suites: 762/767 in the first pass. auth-e2e 28/30 → 30/30 on an unchanged re-run (15c/15d read
       the reset result after a fixed 2.5 s, before it had finished). offers-behaviour 41/44 twice → **44/44 twice**
       after the test fix `3aa2803` (A19–A21 now wait for the special-offers render instead of a fixed 2 s; the page
       renders only after the whole catalogue loads, up to ~11 s here; assertions unchanged; not a storefront defect);
@@ -503,9 +503,12 @@ Dependencies & risks / Next action.
     auth-rate-limit-tests already showed 79/79 and 51/51 (2026-11-14) and now show the 2026-11-15 re-run;
   - the README's opening list now gives 29 files and says all 17 database-backed suites are guarded (it said 23
     files, with 14 suites on the working database).
-- Remains: nothing for the rows. The README's "Aggregate status" and "Status against the current code"
-  paragraphs still describe October results and are not yet rewritten.
-- Evidence: `tests/README.md` rows; P2.2, P2.3.
+  - the README's status paragraphs were rewritten (2026-11-15): "Run the whole set" (29 files, both groups),
+    "Aggregate status (2026-11-15)" (all 29 files passed: 1,128 database-backed checks + 456 database-free, as
+    same-day group results, not one combined run) and "Earlier record (history)" (817/817 on 2026-11-13, 925/925
+    on 2026-10-09). "Status against the current code" (October) was removed.
+- Remains: nothing.
+- Evidence: `tests/README.md` rows and opening sections; P2.2, P2.3.
 - Dependencies & risks: nine of the database-free suites loaded `.env` on 2026-11-15 (run with nothing set, as
   documented); their own values (`DB_PORT=1`, fake keys) take precedence, so no database or outside service was
   reachable.
