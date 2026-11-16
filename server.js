@@ -1669,10 +1669,14 @@ app.get("/api/products/:id/reviews", async (req, res) => {
 });
 
 app.post("/api/products/:id/reviews", requireAuth, async (req, res) => {
-  const { rating, comment } = req.body;
+  const { rating, comment } = req.body || {};
   const productId = req.params.id;
-  if (!rating || rating < 1 || rating > 5) {
-    return res.status(400).json({ error: "Rating must be between 1 and 5." });
+  // Only a JSON number that is a whole number from 1 to 5. Strings (even "4"), decimals, booleans,
+  // null, NaN and missing values are refused here, before anything is read, inserted or
+  // recalculated. (A non-numeric string used to slip past the old `rating < 1 || rating > 5`
+  // check, because every comparison with NaN is false, and was stored as a 0-star review.)
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+    return res.status(400).json({ error: "Rating must be a whole number from 1 to 5." });
   }
   try {
     const [purchaseCheck] = await pool.query(
