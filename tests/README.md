@@ -1,16 +1,18 @@
 # Local regression suites
 
-Twenty-nine standalone Node test files (no test framework, no shared runner; each
+Thirty standalone Node test files (no test framework, no shared runner; each
 file is run on its own):
 
-- **Seventeen database-backed suites.** Each starts its **own** `server.js` on a
+- **Eighteen database-backed suites.** Each starts its **own** `server.js` on a
   private port, runs its checks, then deletes every fixture it created and restores
-  stock. **All seventeen are guarded** (since T04, 2026-11-13): each refuses to start
+  stock. **All eighteen are guarded** (since T04, 2026-11-13): each refuses to start
   without the isolated-database guard and runs only against an isolated `nf_test_*`
   test database on 127.0.0.1:3308 — never the working `neofragrances` database. See
   "Isolated runs of the fourteen converted suites", "Isolated-database run of
-  `admin-api-tests.js`", "Isolated-database run of `payment-tests.js`" and "Isolated
-  harness for `e2e-checkout.js`". All seventeen passed on 2026-11-15 (P2.2/P2.3).
+  `admin-api-tests.js`", "Isolated-database run of `payment-tests.js`", "Isolated
+  harness for `e2e-checkout.js`" and "Isolated run of `review-api-tests.js`". The original
+  seventeen passed on 2026-11-15 (P2.2/P2.3); the eighteenth, `review-api-tests.js`
+  (storefront roadmap R8), passed 17/17 on 2026-11-16 after the rating-validation fix.
 - **Eleven database-free suites.** Nine load the real `server.js` with an in-memory fake
   `./db`: `auth-rate-limit-tests.js`, `security-headers-tests.js`,
   `payment-reliability-tests.js`, `payment-issues-tests.js`, `admin-session-tests.js`,
@@ -20,12 +22,15 @@ file is run on its own):
 - **One guard self-test**, `isolated-db-guard-tests.js`, which starts no `server.js`
   and opens no database connection.
 
-**Run the whole set.** The table below lists all twenty-nine files. It is easy to run
+**Run the whole set.** The table below lists all thirty files. It is easy to run
 only the database-backed suites and forget the twelve database-free ones (including
 the guard self-test), or the reverse; a regression pass needs both groups.
 
-**Aggregate status (2026-11-15).** Every one of the twenty-nine files passed on
-2026-11-15 against the current application code: backend application files unchanged
+**Aggregate status (2026-11-15; `review-api-tests.js` added 2026-11-16).** Every one of the
+twenty-nine files that existed then passed on 2026-11-15 against the application code of
+that day (the 2026-11-16 rating-validation change in `server.js`, see "Isolated run of
+`review-api-tests.js`", came later and has so far been run only through that suite and
+`security-headers-tests.js`): backend application files unchanged
 since `ff5a9f4` (2026-11-14, comment-only) and frontend `a88a2b6` (with P3.1). The
 groups ran separately, one suite at a time, on the same day:
 
@@ -99,6 +104,7 @@ Previously: **614/614** (2026-10-04), across eleven suites, before
 | `offers-behaviour.js` | Offer **behaviour**: live / expired / scheduled / disabled, the expiry boundary, status precedence, storefront sale pricing. Own DB-clock-relative fixtures. A23 waits (up to 10 s) for the sale price to reach the catalogue card instead of reading it after a fixed 800 ms | 5066 | 9341 | **44/44** (2026-11-15, twice, after `3aa2803`: A19–A21 now wait up to 15 s for the special-offers render — the featured banner, or the no-offers state — instead of reading after a fixed 2 s; assertions unchanged. Before the fix the same P2.2 run gave 41/44 twice: offers.js renders only after productsReady (the whole catalogue) and `/api/offers/active`, which took up to ~11 s after navigation; a timeline diagnostic showed the banner appears late and never disappears. P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1). Earlier: 44/44 (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 44/44 |
 | `platform-tests.js` | CORS allowlist + `GET /api/health` (three server instances) | 5063, 5064, 5065 | — | **19/19** (2026-11-15, P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1). Earlier: 19/19 (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 19/19 |
 | `maintenance-tests.js` | Maintenance mode: the global guard, the bypass list, the admin toggle, the TTL cache, and fail-open on a settings read failure | 5067, 5068 | 9342 | **85/85** (2026-11-15, P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1). Earlier: 85/85 (2026-11-14, guarded on `nf_test_phase1_20261029` at 3308, after the maintenance-guard case fix: M26a–d added — payment initialization and other customer routes in other casings get the maintenance 503, `PATCH /API/ME` is blocked and changes nothing, bypass routes in other casings still answer. Harness hardened the same day: every CDP command has a 15 s timeout, screenshots cannot hang the run, M27 polls up to 15 s for the redirect, and Edge starts with sync and background networking off — a fresh profile had opened a sync dialog that hung an earlier run). Earlier: 81/81 (2026-11-13, T04) |
+| `review-api-tests.js` | Customer review API (storefront roadmap R8, 2026-11-16): `GET` / `POST /api/products/:id/reviews` — login required; only a JSON whole number 1–5 is a rating (strings including `"4"`, decimals, 0, >5, booleans, null, arrays, objects, a missing rating and an empty body are refused before anything is stored or recalculated); verified purchase from real order history; client-supplied verified / hidden / user / product fields ignored; hidden reviews never served; no account data beyond the reviewer's name; product totals recalculated. Duplicate reviews, comment length and unknown product ids are printed as `OBSERVATION` lines for R3, not asserted | 5093 | — | **17/17**, 3 observations (2026-11-16, isolated `nf_test_phase1_20261029` on 3308, guarded, run on its own; backend with the rating-validation fix). First run 11/15 found the defect it now guards against — see "Isolated run of `review-api-tests.js`" |
 | `account-controls-tests.js` | Account Controls: customer disable / enable, token-version invalidation, the account-status cache, local + Google login and password-reset behaviour, the payment-settlement exception, the admin control, and disabled-session handling in the storefront | 5071, 5072 | 9343 | **87/87** (2026-11-15, P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1). Earlier: 87/87 (2026-11-14, after G-9 password minimum: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 87/87 (2026-11-14, after G-8 email normalisation and the admin render waits: isolated `nf_test_phase1_20261029` on 3308, guarded). An earlier run the same day, before the render waits, was 77/87 under load: A68 read `/admin/customer.html` while it still showed its loading skeleton, and A69–A77 cascaded. An unchanged re-run then passed 87/87. A68 and A74/A75 now wait (up to 20 s) until the page is no longer `aria-busy` and has rendered. Earlier: 87/87 (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded); 87/87 |
 | `order-status-history-tests.js` | Order Status History: the migration 006 schema and backfill, the admin status-transition rules (forward / cancel / backward-with-note / final), one history row per real change, atomicity with the restock, the customer and admin history views, and both order pages in headless Edge | 5073 | 9344 | **92/92** (2026-11-15, P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1). Earlier: 92/92 (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 92/92 |
 | `offers-multi-product-tests.js` | Multi-product offers (Phase 6A-6D): migration 007's UNIQUE (offer_id, product_id), `items[]` create / update (1-50 products, atomic, per-item validation), the grouped admin listing, the lowest-live-price rule on every storefront surface and in the cart, the admin offer editor, and the "+N more in this offer" banner / spotlight. Never touches offer 1, offer 30002 or real products | 5074 | 9345 | **127/127** (2026-11-15, P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1). Earlier: 127/127 (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 127/127 |
@@ -497,10 +503,50 @@ Test correction after T04 (not caused by isolation):
   (`slot.outerHTML = …`), so the placeholder ids no longer exist after rendering; H2a now counts
   only sections outside `.site-header` / `.site-footer`. Re-run 2026-11-13: 62/62.
 
+### Isolated run of `review-api-tests.js` (R8, 2026-11-16)
+
+The customer review API had no test of its own until storefront roadmap R8. The suite
+follows the T04 pattern above: `requireIsolation` before dotenv and `db.js`,
+`verifyParentIdentity` before any fixture, and `startGuardedServer` on port **5093** with
+its own random `JWT_SECRET`. A plain `node tests/review-api-tests.js` refuses and opens
+no connection.
+
+- **Guard requirements.** The same environment as the other guarded suites (see
+  "Isolated runs of the fourteen converted suites" for the launch block): the guard
+  preload in `NODE_OPTIONS`, `NF_TEST_MODE=isolated`, `DB_NAME = NF_TEST_DB_NAME`
+  (`nf_test_*`), `NF_TEST_DB_SERVER_HOSTNAME`, `DB_HOST=127.0.0.1`, `DB_PORT=3308`. No
+  frontend, Edge, Paystack or email is used. Run it on its own, with the 3308 instance
+  started per `RUNBOOK-LOCAL-DEV-3308.md`.
+- **Fixtures.** Eight customers (signed tokens, no passwords), one address and one order
+  for the "verified purchase" case, and **three borrowed products** — the first three
+  active products with no review rows. Their `avg_rating` / `review_count` are read
+  first and written back at the end; everything the suite inserts is deleted in
+  `finally`, and the cleanup line prints what is left (`{"r":0,"u":0}`) and the restored
+  totals. The restore is an `UPDATE`, so MariaDB moves those three products'
+  `updated_at` (`ON UPDATE CURRENT_TIMESTAMP`): the test database's `products`
+  checksum changes even though every rating, count and stock value is restored exactly.
+- **Not asserted, reported for R3 (review integrity).** A second review of the same
+  product by the same customer (201 today), a 20,000-character comment (201) and an
+  unknown product id (500) are printed as `OBSERVATION` lines, so R3 can change that
+  behaviour without rewriting the suite.
+- **Results.** First run, 2026-11-16 00:14: **11/15**, exit 1. It found a real defect:
+  `POST /api/products/:id/reviews` accepted `"rating": "abc"` (the old check
+  `!rating || rating < 1 || rating > 5` lets a non-numeric string through, because every
+  comparison with NaN is false) and MariaDB stored it as a 0-star review; V9, V10 and V12
+  failed as knock-on effects of that extra review. The route now accepts only
+  `Number.isInteger(rating)` from 1 to 5 (strings such as `"4"` included in the refusal),
+  and V4 / V4a / V4b were extended to cover every rejected shape and each valid rating.
+  Second run, 2026-11-16 00:34: **17/17**, exit 0, 3 observations. Both runs: the
+  working `neofragrances` database was identical before and after (`CHECKSUM TABLE`, row
+  counts and auto-increments of all 16 tables, plus every product's rating, review count,
+  stock and `updated_at`); in the test database every product's rating, review count and
+  stock matched the before-run values, no fixture rows were left, and only
+  auto-increments and the borrowed products' `updated_at` changed.
+
 ## Running
 
 All suites locate the repo themselves — no environment variable needed to find it.
-**Since T04 (2026-11-13) every database-backed suite — all seventeen — refuses to start
+**Since T04 (2026-11-13) every database-backed suite — all eighteen — refuses to start
 without the isolated-database configuration** described under "Prerequisites", before it
 loads dotenv or `db.js`; a plain `node tests/<suite>.js` exits with "Refusing to run …"
 and touches no database. (`e2e-checkout.js` also needs `OUT_DIR` and
@@ -528,9 +574,9 @@ contains it and refuses a `SERVER_DIR` that names any other directory.
 
 - **Database:** no suite uses the working `neofragrances` database or `.env` any more (T04).
   The eleven database-free suites and `isolated-db-guard-tests.js` need no database. All
-  seventeen database-backed suites need the isolated test database below. The browser
+  eighteen database-backed suites need the isolated test database below. The browser
   suites also need the frontend on `http://127.0.0.1:5500` and Microsoft Edge.
-- **Isolated test database (all seventeen database-backed suites; until 2026-11-13 only
+- **Isolated test database (all eighteen database-backed suites; until 2026-11-13 only
   `admin-api-tests.js`, `payment-tests.js`, `e2e-checkout.js`).**
   - A dedicated database whose name matches `^nf_test_[a-z0-9]+(_[a-z0-9]+)*$` on
     `127.0.0.1:3308`, provisioned from a backup of the working schema and brought up to
@@ -591,7 +637,7 @@ contains it and refuses a `SERVER_DIR` that names any other directory.
 | `OUT_DIR` | `e2e-checkout.js` | **Required**, no default: an absolute, existing directory outside both repositories and not the bare system temp folder; each run creates a new `e2e-checkout-<run id>` folder in it (kept) |
 | `EDGE_PROFILE_PARENT` | `e2e-checkout.js` | **Required**, same rules as `OUT_DIR`; each run creates a new `nf-edge-e2e-<run id>` Edge profile in it and deletes only that folder at the end |
 | `.env` values | none of the database-backed suites (the guard blocks `.env`); the database-free suites load it unless dotenv is blocked | Each suite injects its own throwaway `JWT_SECRET` |
-| `NF_TEST_MODE`, `NF_TEST_DB_NAME`, `NF_TEST_DB_SERVER_HOSTNAME`, `NODE_OPTIONS`, `DB_*` | all seventeen database-backed suites | Required; see "Isolated test database" above. `.env` is blocked by the guard |
+| `NF_TEST_MODE`, `NF_TEST_DB_NAME`, `NF_TEST_DB_SERVER_HOSTNAME`, `NODE_OPTIONS`, `DB_*` | all eighteen database-backed suites | Required; see "Isolated test database" above. `.env` is blocked by the guard |
 
 **Run them one at a time.** `payment-tests.js`, `e2e-checkout.js` and `auth-e2e.js`
 all use port **5055**, so starting one right after another fails with
@@ -663,7 +709,7 @@ all use port **5055**, so starting one right after another fails with
   SendGrid request is possible from any suite.
 - No secrets live in these files — each generates a random `JWT_SECRET` per run. Fixture
   passwords and fake keys (`sk_test_mock`) are test values only.
-- The seventeen database-backed suites do write to a local database — since T04
+- The eighteen database-backed suites do write to a local database — since T04
   (2026-11-13) only ever an isolated `nf_test_*` database on 127.0.0.1:3308, never the
   working `neofragrances` database — (temporary users, addresses, orders, coupons,
   offers, products, reviews, wishlist rows) and delete it again in a `finally` block
