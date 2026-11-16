@@ -1658,7 +1658,7 @@ app.get("/api/products/:id/reviews", async (req, res) => {
       `SELECT reviews.*, users.full_name FROM reviews
        JOIN users ON reviews.user_id = users.id
        WHERE reviews.product_id = ? AND reviews.hidden = 0
-       ORDER BY reviews.created_at DESC`,
+       ORDER BY reviews.created_at DESC, reviews.id DESC`, // id breaks same-second ties: newest first, always
       [req.params.id]
     );
     res.json(rows);
@@ -1668,33 +1668,81 @@ app.get("/api/products/:id/reviews", async (req, res) => {
   }
 });
 
-app.post("/api/products/:id/reviews", requireAuth, async (req, res) => {
-  const { rating, comment } = req.body || {};
-  const productId = req.params.id;
+// ---------- Review integrity (R3 / P1.19, owner decisions 2026-11-16) ----------
+// One review per customer per product: a second submission is refused (409) and the
+// customer edits theirs instead (PUT .../reviews/mine). Migration 010 backs this with
+// UNIQUE (product_id, user_id). Comments are trimmed text of at most 1,000 characters.
+// "Verified purchase" comes from the customer's own orders, ignoring cancelled ones.
+const REVIEW_COMMENT_MAX = 1000;
+
+// Validates a create/edit body. Returns { rating, comment } or { error, field }.
+function reviewInput(body) {
+  const { rating, comment } = body || {};
   // Only a JSON number that is a whole number from 1 to 5. Strings (even "4"), decimals, booleans,
-  // null, NaN and missing values are refused here, before anything is read, inserted or
-  // recalculated. (A non-numeric string used to slip past the old `rating < 1 || rating > 5`
-  // check, because every comparison with NaN is false, and was stored as a 0-star review.)
+  // null, NaN and missing values are refused before anything is read, inserted or recalculated.
+  // (A non-numeric string used to slip past the old `rating < 1 || rating > 5` check, because
+  // every comparison with NaN is false, and was stored as a 0-star review.)
   if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
-    return res.status(400).json({ error: "Rating must be a whole number from 1 to 5." });
+    return { error: "Rating must be a whole number from 1 to 5.", field: "rating" };
   }
-  try {
-    const [purchaseCheck] = await pool.query(
-      `SELECT order_items.id FROM order_items
+  if (comment !== undefined && comment !== null && typeof comment !== "string") {
+    return { error: "Your comment must be text.", field: "comment" };
+  }
+  const text = typeof comment === "string" ? comment.trim() : "";
+  if (text.length > REVIEW_COMMENT_MAX) {
+    return { error: `Please keep your comment to ${REVIEW_COMMENT_MAX.toLocaleString("en-GB")} characters or fewer.`, field: "comment" };
+  }
+  return { rating, comment: text || null };
+}
+
+// The product a review may belong to: a positive whole id of an active (not archived) product.
+async function reviewableProductId(rawId) {
+  if (!/^\d+$/.test(String(rawId)) || !isPositiveId(rawId)) return null;
+  const [rows] = await pool.query("SELECT id FROM products WHERE id = ? AND deleted_at IS NULL", [Number(rawId)]);
+  return rows.length ? rows[0].id : null;
+}
+
+async function isVerifiedPurchase(userId, productId) {
+  const [rows] = await pool.query(
+    `SELECT order_items.id FROM order_items
        JOIN orders ON order_items.order_id = orders.id
-       WHERE orders.user_id = ? AND order_items.product_id = ? LIMIT 1`,
-      [req.user.id, productId]
-    );
-    const isVerified = purchaseCheck.length > 0;
+      WHERE orders.user_id = ? AND order_items.product_id = ? AND orders.status <> 'Cancelled'
+      LIMIT 1`,
+    [userId, productId]
+  );
+  return rows.length > 0;
+}
+
+const isDuplicateKey = err => !!err && (err.code === "ER_DUP_ENTRY" || err.errno === 1062);
+const REVIEW_EXISTS_MESSAGE = "You've already reviewed this fragrance. You can edit your review instead.";
+
+app.post("/api/products/:id/reviews", requireAuth, async (req, res) => {
+  const input = reviewInput(req.body);
+  if (input.error) return res.status(400).json({ error: input.error, field: input.field });
+  try {
+    const productId = await reviewableProductId(req.params.id);
+    if (!productId) return res.status(404).json({ error: "Product not found.", code: "PRODUCT_NOT_FOUND" });
+
+    // A hidden (moderated) review counts too: it can be edited, not replaced by a fresh one.
+    const [existing] = await pool.query("SELECT id FROM reviews WHERE product_id = ? AND user_id = ?", [productId, req.user.id]);
+    if (existing.length) return res.status(409).json({ error: REVIEW_EXISTS_MESSAGE, code: "REVIEW_EXISTS", reviewId: existing[0].id });
+
+    const isVerified = await isVerifiedPurchase(req.user.id, productId);
 
     // Columns are enumerated explicitly and `hidden` is NOT among them, so a
     // client-supplied hidden value can never be read or persisted here — only
     // an admin can change visibility, via PATCH /api/admin/reviews/:id/hidden.
     // Do not convert this to a spread or "SET ?" pattern.
-    await pool.query(
-      "INSERT INTO reviews (product_id, user_id, rating, comment, is_verified_purchase) VALUES (?, ?, ?, ?, ?)",
-      [productId, req.user.id, rating, comment || null, isVerified]
-    );
+    try {
+      await pool.query(
+        "INSERT INTO reviews (product_id, user_id, rating, comment, is_verified_purchase) VALUES (?, ?, ?, ?, ?)",
+        [productId, req.user.id, input.rating, input.comment, isVerified]
+      );
+    } catch (err) {
+      // Two submissions at once: migration 010's UNIQUE index lets only one through.
+      if (isDuplicateKey(err)) return res.status(409).json({ error: REVIEW_EXISTS_MESSAGE, code: "REVIEW_EXISTS" });
+      throw err;
+    }
 
     await recalculateProductRating(pool, productId);
 
@@ -1702,6 +1750,55 @@ app.post("/api/products/:id/reviews", requireAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Could not submit review." });
+  }
+});
+
+// The signed-in customer's own review of a product (or null), so the product page can show
+// it with an Edit option instead of a blank form. Includes `hidden`, so a moderated review
+// can be explained to its author; no other customer's data is returned.
+app.get("/api/products/:id/reviews/mine", requireAuth, async (req, res) => {
+  try {
+    const productId = await reviewableProductId(req.params.id);
+    if (!productId) return res.status(404).json({ error: "Product not found.", code: "PRODUCT_NOT_FOUND" });
+    const [rows] = await pool.query(
+      `SELECT id, product_id, rating, comment, is_verified_purchase, hidden, created_at, updated_at
+         FROM reviews WHERE product_id = ? AND user_id = ?`,
+      [productId, req.user.id]
+    );
+    res.json({ review: rows[0] || null });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not fetch your review." });
+  }
+});
+
+// Edit the signed-in customer's own review: rating and comment (same rules as creating),
+// with "verified purchase" re-checked against their orders. `hidden` is never changed here,
+// so editing cannot undo moderation.
+app.put("/api/products/:id/reviews/mine", requireAuth, async (req, res) => {
+  const input = reviewInput(req.body);
+  if (input.error) return res.status(400).json({ error: input.error, field: input.field });
+  try {
+    const productId = await reviewableProductId(req.params.id);
+    if (!productId) return res.status(404).json({ error: "Product not found.", code: "PRODUCT_NOT_FOUND" });
+    const [rows] = await pool.query("SELECT id FROM reviews WHERE product_id = ? AND user_id = ?", [productId, req.user.id]);
+    if (!rows.length) return res.status(404).json({ error: "You haven't reviewed this fragrance yet.", code: "REVIEW_NOT_FOUND" });
+
+    const isVerified = await isVerifiedPurchase(req.user.id, productId);
+    await pool.query(
+      "UPDATE reviews SET rating = ?, comment = ?, is_verified_purchase = ? WHERE id = ? AND user_id = ?",
+      [input.rating, input.comment, isVerified, rows[0].id, req.user.id]
+    );
+    await recalculateProductRating(pool, productId);
+
+    const [[review]] = await pool.query(
+      "SELECT id, product_id, rating, comment, is_verified_purchase, hidden, created_at, updated_at FROM reviews WHERE id = ?",
+      [rows[0].id]
+    );
+    res.json({ success: true, isVerified, review });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not update your review." });
   }
 });
 

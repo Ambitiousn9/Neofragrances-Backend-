@@ -1,0 +1,73 @@
+-- ============================================================
+-- 010  reviews (product_id, user_id) — UNIQUE index
+-- ============================================================
+-- Backlog: P1.19 (duplicate-review prevention), storefront roadmap R3.
+-- Status: applied LOCAL ONLY (test database nf_test_phase1_20261029 and the local working
+--         database, after a backup dump and the PRE-CHECK). NOT applied to production —
+--         production application pending with 002–009 (Phase 5).
+--
+-- WHY
+--   Owner decision (2026-11-16): one review per customer per product. A second
+--   submission is refused (409) and the customer edits their existing review
+--   instead (PUT /api/products/:id/reviews/mine). Before this, the API inserted
+--   every submission, so one customer could post many reviews of the same product
+--   and outweigh everyone else in its average. The server now checks before
+--   inserting; this UNIQUE index makes "one review per customer per product" a
+--   database invariant, so two simultaneous submissions cannot both succeed
+--   (the second insert fails with ER_DUP_ENTRY, which the API reports as 409).
+--
+--   Hidden (moderated) reviews still count: a customer whose review was hidden
+--   cannot post a fresh one to get around moderation; they can edit theirs, and
+--   it stays hidden until an admin decides otherwise.
+--
+-- EXISTING INDEXES — kept on purpose
+--   `product_id` (product_id) becomes a left-prefix of this index and is
+--   technically redundant, but it is left in place: reviews_ibfk_1 may be using
+--   it, and keeping it makes this migration purely additive with a one-statement
+--   rollback. `user_id` (user_id) is still needed by reviews_ibfk_2 and for
+--   lookups by customer.
+--
+-- PRE-CHECK (must return zero rows before applying, on every database)
+--   SELECT product_id, user_id, COUNT(*) AS n
+--     FROM reviews
+--    GROUP BY product_id, user_id
+--   HAVING COUNT(*) > 1;
+--
+--   -- the index must not already exist (expect 0)
+--   SELECT COUNT(*) AS uq_exists
+--     FROM information_schema.STATISTICS
+--    WHERE TABLE_SCHEMA = DATABASE()
+--      AND TABLE_NAME   = 'reviews'
+--      AND INDEX_NAME   = 'uq_reviews_product_user';
+--
+--   If the first query returns rows, STOP: which review to keep is an owner
+--   decision (for example the newest, or the one marked verified). Never delete
+--   duplicates automatically, and never in production without a backup.
+--
+-- APPLY
+ALTER TABLE reviews
+  ADD UNIQUE KEY uq_reviews_product_user (product_id, user_id);
+
+-- VERIFY
+--   SHOW INDEX FROM reviews WHERE Key_name = 'uq_reviews_product_user';
+--   -- expect two rows (product_id seq 1, user_id seq 2), Non_unique = 0
+--
+--   SELECT COUNT(*) FROM reviews;
+--   -- unchanged: adding the index writes no data
+--
+-- ROLLBACK
+--   ALTER TABLE reviews DROP INDEX uq_reviews_product_user;
+--   -- Safe: removes the guard only; no data changes. The server's own
+--   -- duplicate check keeps working without the index (minus the race guard).
+--
+-- RELEASE CHECKLIST (production / TiDB Cloud — not done)
+--   1. The PRE-CHECK must pass against production first. Production review data
+--      has not been inspected for duplicates.
+--   2. Apply BEFORE the server release that adds the 409 / edit behaviour, so the
+--      database already rejects duplicate pairs when it ships.
+--   3. Deliberately plain SQL — no "IF NOT EXISTS" — so it is portable across
+--      MariaDB 10.4 (local) and TiDB (production). Re-running it fails safely with
+--      "Duplicate key name"; it changes nothing.
+--   4. No CHECK constraint and no foreign-key change, so it adds no new TiDB
+--      version assumption.
+-- ============================================================
