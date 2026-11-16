@@ -7,8 +7,8 @@ Master backlog for the rebuild. Covers both repositories:
 - `neofragrances-frontend` — static storefront + admin portal (Netlify).
 - `neofragrances-server` — Express 5 API + MariaDB/TiDB (Render, TiDB Cloud). This file lives here.
 
-**Last updated: 2026-11-15.** Built from the read-only project audit of 14 November 2026 and updated since
-as work landed (most recently P3.1, P4.5 and the P2.2–P2.4 regression results on 2026-11-15). Every status
+**Last updated: 2026-11-16.** Built from the read-only project audit of 14 November 2026 and updated since
+as work landed (most recently the storefront roadmap R9–R11 entries on 2026-11-15, and R3 / P1.19 review integrity with migration 010 on 2026-11-16). Every status
 below cites its evidence (commit, file:line, test name and result, or database query). Where the
 evidence was not sufficient, the task says **NEEDS VERIFICATION** rather than guessing. The previous version
 of this file (last edited 2026-10-02, commit `4cc0ef6`) is summarised in the archive at the end.
@@ -420,13 +420,33 @@ Dependencies & risks / Next action.
 - Dependencies & risks: new migrations (010+); production data backfill.
 - Next action: owner decision.
 
-**P1.19 — Duplicate-review prevention and verified-purchase marking** · *NEEDS VERIFICATION*
-- Required: one review per customer per product; verified-purchase reviews marked.
-- Exists: `reviews.is_verified_purchase` is used by admin-api-tests fixtures. Uniqueness was not checked in the 2026-11-14 audit.
-- Remains: inspect the review endpoints and schema.
-- Evidence: insufficient.
-- Dependencies & risks: a uniqueness constraint needs a migration and a production duplicate check.
-- Next action: read-only inspection.
+**P1.19 — Duplicate-review prevention and verified-purchase marking (storefront roadmap R3)** · *COMPLETE (Local)*
+- Required: one review per customer per product; verified-purchase reviews marked; valid input only.
+- Owner decisions (2026-11-16): a second review is refused and the customer edits theirs instead;
+  comments at most 1,000 characters; migration 010 applied to the test and local working databases;
+  cancelled orders do not make a verified purchase.
+- Exists:
+  - **migration 010** (`010_reviews_one_per_customer.sql`): UNIQUE (product_id, user_id) on `reviews`;
+  - `POST /api/products/:id/reviews`: only a JSON whole number 1–5 is a rating (backend `81e8ab8`, found by the
+    R8 suite); a second review by the same customer → 409 `REVIEW_EXISTS`, hidden reviews included (the index
+    turns a simultaneous duplicate into `ER_DUP_ENTRY` → 409); comments are text, trimmed, ≤ 1,000 characters;
+    unknown, malformed or archived products → 404 `PRODUCT_NOT_FOUND` (was a 500);
+  - verified purchase ignores `Cancelled` orders;
+  - `GET` / `PUT /api/products/:id/reviews/mine`: a customer reads and edits their own review (verified
+    re-checked, `hidden` never changed, totals recalculated);
+  - the public list orders by `created_at DESC, id DESC` (stable for same-second reviews);
+  - product page (`js/reviews.js`): the customer's own review with Edit instead of a blank form, a 1,000-character
+    counter, the moderation note, a plain network-error message.
+- Remains: production (migration 010 with 002–009, P5.1; its pre-check must pass on production data first).
+  Existing reviews keep the verified flag they were given; only new or edited reviews use the cancelled-order rule.
+- Evidence: backend `81e8ab8`, `b496d1d`, `ab409ab`; frontend `a13ddff`. Tests (guarded, `nf_test_phase1_20261029`
+  with 010, 2026-11-16): review-api-tests 39/39 twice; admin-api-tests 112/112, admin-e2e 98/98,
+  account-controls-tests 87/87. Frontend reviews-ui-tests 37/37, all frontend suites 327/327; real-browser check of
+  the product page under the real CSP 18/18 twice. Backup dumps before 010:
+  `NeoFragrances-DB-Backups\pre-010-reviews-20261116-165517`. Working database data unchanged by the migration and
+  by every test run.
+- Dependencies & risks: production duplicate check before 010 (P5.1, P5.3).
+- Next action: Phase 5.
 
 **P1.20 — Email change with re-verification** · *NOT STARTED*
 - Required: customers can change their email, with the new address verified.
@@ -838,10 +858,11 @@ Dependencies & risks / Next action.
   - no invented or placeholder reviews;
   - the CSP (styles in CSS files, no inline scripts);
   - P3.3 dark mode (R10);
-  - **review data must be genuine and reliable: coordinate with the storefront roadmap's R3 review-integrity
-    work** (P1.19: one review per customer per product, input limits);
+  - **review data must be genuine and reliable**: the storefront roadmap's R3 review-integrity work is
+    **COMPLETE (Local)** (P1.19, 2026-11-16: one review per customer per product, 1,000-character comments,
+    valid ratings only), so the moving display can draw on one review per customer;
   - **owner decisions D15**: the minimum-review threshold and the display location both need owner confirmation.
-- Next action: owner decides the minimum review count and placement (D15), then implement after R3.
+- Next action: owner decides the minimum review count and placement (D15), then implement (R3 is done).
 
 **P3.15 — R9 / ACCT-AV-01: customer profile-picture management** · *NOT STARTED*
 - **Owner-approved planned feature** (storefront roadmap **R9**, recorded 2026-11-15). Not an optional suggestion.
@@ -971,13 +992,15 @@ Dependencies & risks / Next action.
 ### Phase 5 — Database release preparation
 *Objective: production TiDB can receive the rebuild safely and reversibly.*
 
-**P5.1 — Apply migrations 002–009 to production** · *BLOCKED (P5.2, P5.3, P6.6)* — NOT STARTED
+**P5.1 — Apply migrations 002–010 to production** · *BLOCKED (P5.2, P5.3, P6.6)* — NOT STARTED
 - Required: the rebuild's schema in production, in order, each verified.
-- Exists: all eight applied and verified **locally only**; each file carries pre-checks, verification and rollback.
+- Exists: all nine applied and verified **locally only**; each file carries pre-checks, verification and rollback.
+  (010, added 2026-11-16 for P1.19, has a duplicate pre-check that must pass on production review data.)
 - Remains: everything in production. See the ledger (section 5).
-- Evidence: each file's `Status:` header; local `information_schema` check (2026-11-14) found all eight present.
+- Evidence: each file's `Status:` header; local `information_schema` check (2026-11-14) found 002–009 present;
+  010 verified with `SHOW INDEX` on both local databases (2026-11-16).
 - Dependencies & risks: TiDB compatibility (P5.2); production backup (P5.3); the release path (P6.6).
-  Features from P1.1, P1.7, P1.9, P1.10, P3.8 and P3.13 depend on these.
+  Features from P1.1, P1.7, P1.9, P1.10, P1.19, P3.8 and P3.13 depend on these.
 - Next action: P5.2.
 
 **P5.2 — Production TiDB capability check** · *NEEDS VERIFICATION*
@@ -1246,14 +1269,17 @@ Dependencies & risks / Next action.
 | 007 | `007_offer_products_unique.sql` | unique offer/product pairs | Applied 2026-10-08 | — | **Not applied** |
 | 008 | `008_products_scent_family.sql` | `products.scent_family` | Applied 2026-10-10 | — | **Not applied** |
 | 009 | `009_payment_issues.sql` | `payment_issues` | Applied 2026-10-17 | — | **Not applied** |
+| 010 | `010_reviews_one_per_customer.sql` | UNIQUE `reviews` (product_id, user_id) (P1.19 / R3) | Applied 2026-11-16 (test DB, then working DB; pre-check 0 duplicates) | — | **Not applied** |
 
 - **Local check (2026-11-14):** `information_schema` on the working database has every object from 002–009.
 - **Production:** none of 002–009 is applied, so **no feature that depends on them is production-ready**:
   coupons, maintenance mode, review moderation, account controls and token revocation, order history,
   scent families, payment issues.
+- **010** (2026-11-16) was applied locally after backup dumps (`NeoFragrances-DB-Backups\pre-010-reviews-20261116-165517`);
+  the working database's data was identical afterwards (only the index added). Like 002–009 it is not in production.
 - **Not yet written** (candidates; each needs a decision first): `learn_articles` (P3.2), order
-  subtotal/discount/shipping and an address snapshot (P1.18), review uniqueness (P1.19), a migration
-  ledger (P5.4), a customer profile-picture column (P3.15). The next free number is 010.
+  subtotal/discount/shipping and an address snapshot (P1.18), a migration ledger (P5.4), a customer
+  profile-picture column (P3.15). The next free number is 011.
 
 ---
 
@@ -1370,7 +1396,7 @@ Per-suite detail: `tests/README.md` (some rows stale — P2.4).
    section once the copy is approved.~~ — **done 2026-11-15** (frontend `a88a2b6`; P3.1 and P4.5 COMPLETE (Local)).
 4. **Owner-approved planned storefront features (recorded 2026-11-15):** R9 profile pictures (P3.15, needs D14),
    R10 customer-facing light/dark mode (P3.3, needs D4; T04 dependency satisfied), R11 scrolling reviews
-   (P3.14, needs D15 and the R3 review-integrity work). The admin dark mode is the separate task P3.16.
+   (P3.14, needs D15; the R3 review-integrity work, P1.19, is done 2026-11-16). The admin dark mode is the separate task P3.16.
 5. ~~**One full guarded regression pass (P2.2)**~~ — **all 17 suites green 2026-11-15**, including the
    `e2e-checkout.js` positive run (P2.3). The rest of the `tests/README.md` clean-up (P2.4).
 6. **Documentation (Phase 6):** READMEs (P6.2), runbook into the repo (P6.4), environment document (P6.5).
