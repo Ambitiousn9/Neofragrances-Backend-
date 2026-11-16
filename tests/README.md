@@ -12,7 +12,8 @@ file is run on its own):
   `admin-api-tests.js`", "Isolated-database run of `payment-tests.js`", "Isolated
   harness for `e2e-checkout.js`" and "Isolated run of `review-api-tests.js`". The original
   seventeen passed on 2026-11-15 (P2.2/P2.3); the eighteenth, `review-api-tests.js`
-  (storefront roadmap R8), passed 17/17 on 2026-11-16 after the rating-validation fix.
+  (storefront roadmap R8), passed 17/17 on 2026-11-16 after the rating-validation fix and
+  39/39 after R3 (review integrity, migration 010).
 - **Eleven database-free suites.** Nine load the real `server.js` with an in-memory fake
   `./db`: `auth-rate-limit-tests.js`, `security-headers-tests.js`,
   `payment-reliability-tests.js`, `payment-issues-tests.js`, `admin-session-tests.js`,
@@ -28,9 +29,14 @@ the guard self-test), or the reverse; a regression pass needs both groups.
 
 **Aggregate status (2026-11-15; `review-api-tests.js` added 2026-11-16).** Every one of the
 twenty-nine files that existed then passed on 2026-11-15 against the application code of
-that day (the 2026-11-16 rating-validation change in `server.js`, see "Isolated run of
-`review-api-tests.js`", came later and has so far been run only through that suite and
-`security-headers-tests.js`): backend application files unchanged
+that day (the 2026-11-16 review changes in `server.js` — rating validation, then R3's
+one-review rule, comment limit, 404s, `/reviews/mine` and the ordering tie-break — and
+migration 010 on `nf_test_phase1_20261029` came later; see "Isolated run of
+`review-api-tests.js`". Since then they have been run through that suite (39/39),
+`security-headers-tests.js` (43/43) and, guarded on 2026-11-16 17:08–17:15 with the R3
+frontend served, the three other suites that touch reviews: `admin-api-tests.js` 112/112,
+`admin-e2e.js` 98/98 and `account-controls-tests.js` 87/87 — working database identical,
+test database changed only in auto-increments): backend application files unchanged
 since `ff5a9f4` (2026-11-14, comment-only) and frontend `a88a2b6` (with P3.1). The
 groups ran separately, one suite at a time, on the same day:
 
@@ -104,7 +110,7 @@ Previously: **614/614** (2026-10-04), across eleven suites, before
 | `offers-behaviour.js` | Offer **behaviour**: live / expired / scheduled / disabled, the expiry boundary, status precedence, storefront sale pricing. Own DB-clock-relative fixtures. A23 waits (up to 10 s) for the sale price to reach the catalogue card instead of reading it after a fixed 800 ms | 5066 | 9341 | **44/44** (2026-11-15, twice, after `3aa2803`: A19–A21 now wait up to 15 s for the special-offers render — the featured banner, or the no-offers state — instead of reading after a fixed 2 s; assertions unchanged. Before the fix the same P2.2 run gave 41/44 twice: offers.js renders only after productsReady (the whole catalogue) and `/api/offers/active`, which took up to ~11 s after navigation; a timeline diagnostic showed the banner appears late and never disappears. P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1). Earlier: 44/44 (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 44/44 |
 | `platform-tests.js` | CORS allowlist + `GET /api/health` (three server instances) | 5063, 5064, 5065 | — | **19/19** (2026-11-15, P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1). Earlier: 19/19 (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 19/19 |
 | `maintenance-tests.js` | Maintenance mode: the global guard, the bypass list, the admin toggle, the TTL cache, and fail-open on a settings read failure | 5067, 5068 | 9342 | **85/85** (2026-11-15, P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1). Earlier: 85/85 (2026-11-14, guarded on `nf_test_phase1_20261029` at 3308, after the maintenance-guard case fix: M26a–d added — payment initialization and other customer routes in other casings get the maintenance 503, `PATCH /API/ME` is blocked and changes nothing, bypass routes in other casings still answer. Harness hardened the same day: every CDP command has a 15 s timeout, screenshots cannot hang the run, M27 polls up to 15 s for the redirect, and Edge starts with sync and background networking off — a fresh profile had opened a sync dialog that hung an earlier run). Earlier: 81/81 (2026-11-13, T04) |
-| `review-api-tests.js` | Customer review API (storefront roadmap R8, 2026-11-16): `GET` / `POST /api/products/:id/reviews` — login required; only a JSON whole number 1–5 is a rating (strings including `"4"`, decimals, 0, >5, booleans, null, arrays, objects, a missing rating and an empty body are refused before anything is stored or recalculated); verified purchase from real order history; client-supplied verified / hidden / user / product fields ignored; hidden reviews never served; no account data beyond the reviewer's name; product totals recalculated. Duplicate reviews, comment length and unknown product ids are printed as `OBSERVATION` lines for R3, not asserted | 5093 | — | **17/17**, 3 observations (2026-11-16, isolated `nf_test_phase1_20261029` on 3308, guarded, run on its own; backend with the rating-validation fix). First run 11/15 found the defect it now guards against — see "Isolated run of `review-api-tests.js`" |
+| `review-api-tests.js` | Customer review API (storefront roadmap R8 + R3, 2026-11-16): `GET` / `POST /api/products/:id/reviews` and `GET` / `PUT /api/products/:id/reviews/mine` — login required; only a JSON whole number 1–5 is a rating (strings including `"4"`, decimals, 0, >5, booleans, null, arrays, objects, a missing rating and an empty body are refused before anything is stored or recalculated); one review per customer per product (409 `REVIEW_EXISTS`; migration 010's UNIQUE index); comments are text of at most 1,000 characters; unknown / archived products → 404; verified purchase from real orders, ignoring cancelled ones; editing own review (moderation unchanged); client-supplied flags ignored; hidden reviews never served; newest first with a stable tie-break; no account data beyond the reviewer's name; product totals recalculated. Needs migration 010 on the test database | 5093 | — | **39/39** twice (2026-11-16 R3, isolated `nf_test_phase1_20261029` on 3308 with migration 010, guarded, run on its own). Earlier: 17/17 (R8, after the rating-validation fix); first run 11/15 found that defect — see "Isolated run of `review-api-tests.js`" |
 | `account-controls-tests.js` | Account Controls: customer disable / enable, token-version invalidation, the account-status cache, local + Google login and password-reset behaviour, the payment-settlement exception, the admin control, and disabled-session handling in the storefront | 5071, 5072 | 9343 | **87/87** (2026-11-15, P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1). Earlier: 87/87 (2026-11-14, after G-9 password minimum: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 87/87 (2026-11-14, after G-8 email normalisation and the admin render waits: isolated `nf_test_phase1_20261029` on 3308, guarded). An earlier run the same day, before the render waits, was 77/87 under load: A68 read `/admin/customer.html` while it still showed its loading skeleton, and A69–A77 cascaded. An unchanged re-run then passed 87/87. A68 and A74/A75 now wait (up to 20 s) until the page is no longer `aria-busy` and has rendered. Earlier: 87/87 (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded); 87/87 |
 | `order-status-history-tests.js` | Order Status History: the migration 006 schema and backfill, the admin status-transition rules (forward / cancel / backward-with-note / final), one history row per real change, atomicity with the restock, the customer and admin history views, and both order pages in headless Edge | 5073 | 9344 | **92/92** (2026-11-15, P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1). Earlier: 92/92 (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 92/92 |
 | `offers-multi-product-tests.js` | Multi-product offers (Phase 6A-6D): migration 007's UNIQUE (offer_id, product_id), `items[]` create / update (1-50 products, atomic, per-item validation), the grouped admin listing, the lowest-live-price rule on every storefront surface and in the cart, the admin offer editor, and the "+N more in this offer" banner / spotlight. Never touches offer 1, offer 30002 or real products | 5074 | 9345 | **127/127** (2026-11-15, P2.2 full regression: isolated `nf_test_phase1_20261029` on 3308, guarded, one suite at a time; backend `78f2541`/`3aa2803`, frontend `a88a2b6` with P3.1). Earlier: 127/127 (2026-11-13, T04: isolated `nf_test_phase1_20261029` on 3308, guarded). Earlier: 127/127 |
@@ -503,7 +509,7 @@ Test correction after T04 (not caused by isolation):
   (`slot.outerHTML = …`), so the placeholder ids no longer exist after rendering; H2a now counts
   only sections outside `.site-header` / `.site-footer`. Re-run 2026-11-13: 62/62.
 
-### Isolated run of `review-api-tests.js` (R8, 2026-11-16)
+### Isolated run of `review-api-tests.js` (R8, 2026-11-16; extended for R3 the same day)
 
 The customer review API had no test of its own until storefront roadmap R8. The suite
 follows the T04 pattern above: `requireIsolation` before dotenv and `db.js`,
@@ -516,19 +522,27 @@ no connection.
   preload in `NODE_OPTIONS`, `NF_TEST_MODE=isolated`, `DB_NAME = NF_TEST_DB_NAME`
   (`nf_test_*`), `NF_TEST_DB_SERVER_HOSTNAME`, `DB_HOST=127.0.0.1`, `DB_PORT=3308`. No
   frontend, Edge, Paystack or email is used. Run it on its own, with the 3308 instance
-  started per `RUNBOOK-LOCAL-DEV-3308.md`.
-- **Fixtures.** Eight customers (signed tokens, no passwords), one address and one order
-  for the "verified purchase" case, and **three borrowed products** — the first three
-  active products with no review rows. Their `avg_rating` / `review_count` are read
+  started per `RUNBOOK-LOCAL-DEV-3308.md`. **Since R3 the test database must have
+  migration 010** (`uq_reviews_product_user`); check D3 fails without it.
+- **Fixtures.** Eleven customers (signed tokens, no passwords), two addresses and two
+  orders (one `Processing`, later set to `Cancelled` by the suite; one `Cancelled`) for the
+  "verified purchase" cases, the id of one archived product (read only), and **three
+  borrowed products** — the first three active products with no review rows. Their `avg_rating` / `review_count` are read
   first and written back at the end; everything the suite inserts is deleted in
   `finally`, and the cleanup line prints what is left (`{"r":0,"u":0}`) and the restored
   totals. The restore is an `UPDATE`, so MariaDB moves those three products'
   `updated_at` (`ON UPDATE CURRENT_TIMESTAMP`): the test database's `products`
   checksum changes even though every rating, count and stock value is restored exactly.
-- **Not asserted, reported for R3 (review integrity).** A second review of the same
-  product by the same customer (201 today), a 20,000-character comment (201) and an
-  unknown product id (500) are printed as `OBSERVATION` lines, so R3 can change that
-  behaviour without rewriting the suite.
+- **R3 review integrity (owner decisions 2026-11-16), now asserted.** Until R3 the suite
+  only printed `OBSERVATION` lines for a second review of the same product (201), a
+  20,000-character comment (201) and an unknown product id (500). R3 replaced them with:
+  D1–D4 one review per customer per product (409 `REVIEW_EXISTS`, also for a hidden review;
+  migration 010 present; the database itself refuses a duplicate pair with
+  `ER_DUP_ENTRY`); C1–C4 comments are text of at most 1,000 characters, trimmed, blank →
+  NULL; P1 unknown, malformed and archived product ids → 404 `PRODUCT_NOT_FOUND`; B1 a
+  cancelled order is not a verified purchase; M1–M5 `GET .../reviews/mine`; U1–U7
+  `PUT .../reviews/mine` (validation, 404 `REVIEW_NOT_FOUND`, saved edit, totals
+  recalculated, verified purchase re-checked, a hidden review stays hidden).
 - **Results.** First run, 2026-11-16 00:14: **11/15**, exit 1. It found a real defect:
   `POST /api/products/:id/reviews` accepted `"rating": "abc"` (the old check
   `!rating || rating < 1 || rating > 5` lets a non-numeric string through, because every
@@ -542,6 +556,17 @@ no connection.
   stock and `updated_at`); in the test database every product's rating, review count and
   stock matched the before-run values, no fixture rows were left, and only
   auto-increments and the borrowed products' `updated_at` changed.
+
+  R3 runs, 2026-11-16 16:56–16:58, after backup dumps of both databases
+  (`NeoFragrances-DB-Backups\pre-010-reviews-20261116-165517`), the 010 pre-check (0
+  duplicate pairs on both) and migration 010 on the test database: first run **38/39** —
+  V9 ("newest first") failed because both reviews were created in the same second and
+  `ORDER BY created_at DESC` had no tie-breaker, so their order was arbitrary (earlier runs
+  passed by timing); `GET /api/products/:id/reviews` now orders by `created_at DESC, id
+  DESC`. Then **39/39** twice, exit 0. The working database was identical before and after
+  all three runs (same measures as above). Migration 010 was then applied to the local
+  working database too (pre-check 0 pairs); its data stayed identical — only the index was
+  added.
 
 ## Running
 

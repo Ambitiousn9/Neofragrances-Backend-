@@ -1,16 +1,19 @@
-// Customer review API (storefront roadmap R8): GET/POST /api/products/:id/reviews against the real
-// server.js (:5093) and an isolated nf_test_* database on 127.0.0.1:3308. Runs ONLY under the
-// isolated-database guard (see tests/README.md, "Isolated test database").
+// Customer review API (storefront roadmap R8, extended for R3 review integrity): GET/POST
+// /api/products/:id/reviews and GET/PUT /api/products/:id/reviews/mine against the real server.js
+// (:5093) and an isolated nf_test_* database on 127.0.0.1:3308. Runs ONLY under the isolated-database
+// guard (see tests/README.md, "Isolated test database"). Needs migration 010 applied to that database.
 //
-// Asserts today's behaviour: login required, rating validation, verified-purchase marking from real
-// order history, client-supplied flags ignored, hidden reviews never served, the product's rating
-// totals recalculated, no account data beyond the reviewer's name. The known gaps that the review-
-// integrity task (R3) will change (a second review of the same product, no comment length limit,
-// an unknown product id) are reported as OBSERVATION lines, never asserted, so R3 can change them
-// without rewriting this suite.
+// Asserts: login required; only a JSON whole number 1–5 is a rating; verified purchase from real
+// orders, ignoring cancelled ones; client-supplied flags ignored; hidden reviews never served; no
+// account data beyond the reviewer's name; totals recalculated. R3: one review per customer per
+// product (409 REVIEW_EXISTS, also for a hidden review; migration 010's UNIQUE index refuses a
+// duplicate pair in the database itself); comments are text of at most 1,000 characters, trimmed;
+// unknown, malformed and archived product ids → 404; a customer reads and edits their own review,
+// edits re-check verified purchase and never change moderation.
 //
-// Fixtures: eight customers, one order, and three borrowed products whose avg_rating / review_count are
-// recorded first and restored at the end. Everything the suite inserts is deleted in `finally`.
+// Fixtures: eleven customers, two orders (one cancelled), and three borrowed products whose
+// avg_rating / review_count are recorded first and restored at the end; one archived product id is
+// read (never written). Everything the suite inserts is deleted in `finally`.
 const path = require("path"), crypto = require("crypto");
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
 const iso = require("./support/isolated-suite");
@@ -131,14 +134,93 @@ const call = async (method, url, token, body) => {
     tot = (await q("SELECT avg_rating, review_count FROM products WHERE id = ?", [P1]))[0];
     check("V15 recalculation ignores hidden reviews (visible 5 and 1 → 3.0, 2)", r.status === 201 && Number(tot.avg_rating) === 3 && tot.review_count === 2, JSON.stringify(tot));
 
-    /* ---------- known gaps, reported for R3 (review integrity), not asserted ---------- */
+    /* ---------- R3: one review per customer per product ---------- */
+    const pairCount = async (u, p) => (await q("SELECT COUNT(*) n FROM reviews WHERE user_id = ? AND product_id = ?", [u, p]))[0].n;
+    const p1Before = (await q("SELECT avg_rating, review_count FROM products WHERE id = ?", [P1]))[0];
     r = await call("POST", `/api/products/${P1}/reviews`, tA, { rating: 2, comment: "second review" });
-    const aCount = (await q("SELECT COUNT(*) n FROM reviews WHERE user_id = ? AND product_id = ?", [A, P1]))[0].n;
-    observe(`R3: a second review of the same product by the same customer → ${r.status}, ${aCount} reviews stored for that pair`);
-    r = await call("POST", `/api/products/${P2}/reviews`, tB, { rating: 4, comment: "x".repeat(20000) });
-    observe(`R3: a 20,000-character comment → ${r.status}`);
-    r = await call("POST", `/api/products/999999999/reviews`, tB, { rating: 4 });
-    observe(`R3: a review of a product id that does not exist → ${r.status}`);
+    check("D1 a second review of the same product by the same customer → 409 REVIEW_EXISTS, still one row, totals unchanged",
+      r.status === 409 && r.data.code === "REVIEW_EXISTS" && Number.isInteger(r.data.reviewId) && await pairCount(A, P1) === 1 &&
+      JSON.stringify((await q("SELECT avg_rating, review_count FROM products WHERE id = ?", [P1]))[0]) === JSON.stringify(p1Before), `${r.status} ${JSON.stringify(r.data)}`);
+    r = await call("POST", `/api/products/${P1}/reviews`, tB, { rating: 5, comment: "fresh start" });
+    check("D2 a customer whose review was hidden cannot post a fresh one (409), so moderation can't be bypassed", r.status === 409 && await pairCount(B, P1) === 1, r.status);
+    const uq = await q(`SELECT COLUMN_NAME c, SEQ_IN_INDEX s, NON_UNIQUE nu FROM information_schema.STATISTICS
+                         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'reviews' AND INDEX_NAME = 'uq_reviews_product_user' ORDER BY SEQ_IN_INDEX`);
+    check("D3 migration 010 is applied: UNIQUE uq_reviews_product_user (product_id, user_id)", JSON.stringify(uq.map(x => [x.c, x.s, Number(x.nu)])) === '[["product_id",1,0],["user_id",2,0]]', JSON.stringify(uq));
+    let dupErr = null;
+    try { await q("INSERT INTO reviews (product_id, user_id, rating) VALUES (?, ?, 3)", [P1, A]); } catch (err) { dupErr = err.code; }
+    check("D4 the database itself refuses a duplicate pair (ER_DUP_ENTRY), so simultaneous submissions can't both succeed", dupErr === "ER_DUP_ENTRY" && await pairCount(A, P1) === 1, dupErr);
+
+    /* ---------- R3: comments ---------- */
+    const D = await mk("Dede Commenter"), tD = tok(D);
+    r = await call("POST", `/api/products/${P2}/reviews`, tD, { rating: 4, comment: "x".repeat(1001) });
+    check("C1 a 1,001-character comment → 400 (field comment), nothing stored", r.status === 400 && r.data.field === "comment" && await pairCount(D, P2) === 0, `${r.status} ${JSON.stringify(r.data)}`);
+    r = await call("POST", `/api/products/${P2}/reviews`, tD, { rating: 4, comment: 12345 });
+    check("C2 a comment that isn't text → 400", r.status === 400 && r.data.field === "comment" && await pairCount(D, P2) === 0, r.status);
+    r = await call("POST", `/api/products/${P2}/reviews`, tD, { rating: 4, comment: `   ${"y".repeat(1000)}   ` });
+    const dRow = (await q("SELECT comment FROM reviews WHERE user_id = ? AND product_id = ?", [D, P2]))[0];
+    check("C3 exactly 1,000 characters (after trimming surrounding spaces) → 201, stored trimmed", r.status === 201 && dRow && dRow.comment === "y".repeat(1000), r.status);
+    const E = await mk("Efua Spaces"), tE = tok(E);
+    r = await call("POST", `/api/products/${P2}/reviews`, tE, { rating: 5, comment: "    " });
+    check("C4 a whitespace-only comment is stored as NULL", r.status === 201 && (await q("SELECT comment FROM reviews WHERE user_id = ?", [E]))[0].comment === null);
+
+    /* ---------- R3: which product ---------- */
+    const archived = (await q("SELECT id FROM products WHERE deleted_at IS NOT NULL ORDER BY id LIMIT 1"))[0];
+    const statuses = [];
+    for (const pid of ["999999999", "abc", "0", "-1", "1.5", archived ? String(archived.id) : "999999998"]) {
+      const x = await call("POST", `/api/products/${pid}/reviews`, tD, { rating: 4 });
+      statuses.push(`${pid}→${x.status}${x.data && x.data.code ? ":" + x.data.code : ""}`);
+    }
+    check(`P1 unknown, malformed and archived product ids → 404 PRODUCT_NOT_FOUND (archived #${archived ? archived.id : "none"})`,
+      statuses.every(x => /→404:PRODUCT_NOT_FOUND$/.test(x)) && (await q("SELECT COUNT(*) n FROM reviews WHERE user_id = ?", [D]))[0].n === 1, statuses.join(", "));
+
+    /* ---------- R3: verified purchase ignores cancelled orders ---------- */
+    const F = await mk("Fiifi Cancelled"), tF = tok(F);
+    const fAddr = (await q("INSERT INTO addresses (user_id, label, full_name, address_line1, city, country, is_default) VALUES (?, 'Home', 'Fiifi', '2 Road', 'Accra', 'Ghana', 1)", [F])).insertId;
+    const fOrder = (await q("INSERT INTO orders (user_id, address_id, total, status, payment_reference) VALUES (?, ?, 100.00, 'Cancelled', ?)", [F, fAddr, `NF-REVIEW-C-${stamp}`])).insertId;
+    await q("INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase) VALUES (?, ?, 1, 100.00)", [fOrder, P2]);
+    r = await call("POST", `/api/products/${P2}/reviews`, tF, { rating: 3 });
+    check("B1 a customer whose only order of the product was cancelled → not a verified purchase", r.status === 201 && r.data.isVerified === false && (await q("SELECT is_verified_purchase v FROM reviews WHERE user_id = ?", [F]))[0].v === 0, JSON.stringify(r.data));
+
+    /* ---------- R3: the customer's own review ---------- */
+    r = await call("GET", `/api/products/${P1}/reviews/mine`);
+    check("M1 GET .../reviews/mine needs a login → 401", r.status === 401);
+    r = await call("GET", `/api/products/${P1}/reviews/mine`, tA);
+    const mineKeys = r.data && r.data.review ? Object.keys(r.data.review).sort().join(",") : "";
+    check("M2 returns the customer's own review with only review fields", r.status === 200 && r.data.review && r.data.review.rating === 5 && r.data.review.comment === "Bought it, love it" && r.data.review.is_verified_purchase === 1 &&
+      mineKeys === "comment,created_at,hidden,id,is_verified_purchase,product_id,rating,updated_at", mineKeys);
+    r = await call("GET", `/api/products/${P1}/reviews/mine`, tD);
+    check("M3 no review of this product yet → { review: null }", r.status === 200 && r.data.review === null, JSON.stringify(r.data));
+    r = await call("GET", `/api/products/${P1}/reviews/mine`, tB);
+    check("M4 a hidden review is returned to its author, marked hidden", r.status === 200 && r.data.review && r.data.review.hidden === 1, JSON.stringify(r.data));
+    r = await call("GET", `/api/products/999999999/reviews/mine`, tA);
+    check("M5 unknown product → 404", r.status === 404 && r.data.code === "PRODUCT_NOT_FOUND");
+
+    /* ---------- R3: editing ---------- */
+    r = await call("PUT", `/api/products/${P1}/reviews/mine`, null, { rating: 2 });
+    check("U1 PUT .../reviews/mine needs a login → 401", r.status === 401);
+    const aBefore = (await q("SELECT rating, comment FROM reviews WHERE user_id = ? AND product_id = ?", [A, P1]))[0];
+    const badEdits = [{ rating: 0 }, { rating: "4" }, { rating: 4.5 }, { rating: 3, comment: "z".repeat(1001) }, {}];
+    const badEditStatuses = [];
+    for (const b of badEdits) badEditStatuses.push((await call("PUT", `/api/products/${P1}/reviews/mine`, tA, b)).status);
+    check("U2 an edit with an invalid rating or an over-long comment → 400, review unchanged", badEditStatuses.every(x => x === 400) &&
+      JSON.stringify((await q("SELECT rating, comment FROM reviews WHERE user_id = ? AND product_id = ?", [A, P1]))[0]) === JSON.stringify(aBefore), badEditStatuses.join(","));
+    r = await call("PUT", `/api/products/${P1}/reviews/mine`, tD, { rating: 4 });
+    check("U3 editing a review that doesn't exist → 404 REVIEW_NOT_FOUND, nothing created", r.status === 404 && r.data.code === "REVIEW_NOT_FOUND" && await pairCount(D, P1) === 0, r.status);
+    r = await call("PUT", `/api/products/${P1}/reviews/mine`, tA, { rating: 2, comment: "  Grew on me less  ", hidden: 1, is_verified_purchase: false, user_id: B });
+    const aAfter = (await q("SELECT rating, comment, hidden, is_verified_purchase v, user_id FROM reviews WHERE id = ?", [r.data && r.data.review ? r.data.review.id : 0]))[0];
+    check("U4 own edit → 200 with the updated review; rating and trimmed comment saved; client flags ignored",
+      r.status === 200 && r.data.review.rating === 2 && aAfter && aAfter.comment === "Grew on me less" && aAfter.hidden === 0 && aAfter.v === 1 && aAfter.user_id === A && await pairCount(A, P1) === 1, JSON.stringify(aAfter));
+    tot = (await q("SELECT avg_rating, review_count FROM products WHERE id = ?", [P1]))[0];
+    check("U5 the edit recalculates P1's totals (visible 2 and 1 → 1.5, 2)", Number(tot.avg_rating) === 1.5 && tot.review_count === 2, JSON.stringify(tot));
+    await q("UPDATE orders SET status = 'Cancelled' WHERE id = ?", [order]);
+    r = await call("PUT", `/api/products/${P1}/reviews/mine`, tA, { rating: 2, comment: "Grew on me less" });
+    check("U6 an edit re-checks verified purchase: after the order is cancelled it is no longer verified", r.status === 200 && r.data.isVerified === false && (await q("SELECT is_verified_purchase v FROM reviews WHERE user_id = ? AND product_id = ?", [A, P1]))[0].v === 0, JSON.stringify(r.data));
+    r = await call("PUT", `/api/products/${P1}/reviews/mine`, tB, { rating: 5, comment: "edited while hidden" });
+    const bRow = (await q("SELECT rating, comment, hidden FROM reviews WHERE user_id = ? AND product_id = ?", [B, P1]))[0];
+    const pubAfter = (await call("GET", `/api/products/${P1}/reviews`)).data || [];
+    tot = (await q("SELECT avg_rating, review_count FROM products WHERE id = ?", [P1]))[0];
+    check("U7 editing a hidden review keeps it hidden: saved, still not served, still not counted",
+      r.status === 200 && bRow.hidden === 1 && bRow.rating === 5 && !pubAfter.some(x => x.user_id === B) && Number(tot.avg_rating) === 1.5 && tot.review_count === 2, JSON.stringify({ bRow, tot }));
   } catch (e) {
     console.error("HARNESS ERROR:", e); results.push(false);
   } finally {
