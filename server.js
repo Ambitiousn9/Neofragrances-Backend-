@@ -1753,6 +1753,55 @@ app.post("/api/products/:id/reviews", requireAuth, async (req, res) => {
   }
 });
 
+// ---------- Homepage review highlights (R11, owner decisions D15 2026-11-16) ----------
+// Public. Genuine reviews only, straight from the reviews table (nothing is generated): visible
+// (hidden = 0), of an active product (not archived), with comment text, of any star rating.
+// The reviewer is shown by a short name built here ("Ama B."), so no full name, user id or
+// other account data leaves the server. At most REVIEW_HIGHLIGHTS_MAX are returned, newest
+// first; when more are eligible a random set is chosen on each request, so over time every
+// eligible review can appear. `total` is the number eligible.
+const REVIEW_HIGHLIGHTS_MAX = 24;
+
+function reviewerShortName(fullName) {
+  const parts = String(fullName || "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "Customer";
+  // Same format the homepage has always shown (owner decision S1: display names unchanged).
+  return parts.length > 1 ? `${parts[0]} ${parts[parts.length - 1].charAt(0)}.` : parts[0];
+}
+
+app.get("/api/reviews/highlights", async (req, res) => {
+  const ELIGIBLE = `FROM reviews r
+                     JOIN products p ON p.id = r.product_id AND p.deleted_at IS NULL
+                     JOIN users u ON u.id = r.user_id
+                    WHERE r.hidden = 0 AND r.comment IS NOT NULL AND TRIM(r.comment) <> ''`;
+  try {
+    const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total ${ELIGIBLE}`);
+    const pick = Number(total) > REVIEW_HIGHLIGHTS_MAX ? "ORDER BY RAND()" : "ORDER BY r.created_at DESC, r.id DESC";
+    const [rows] = await pool.query(
+      `SELECT r.id, r.rating, r.comment, r.is_verified_purchase, r.created_at, u.full_name,
+              p.id AS product_id, p.name AS product_name
+       ${ELIGIBLE} ${pick} LIMIT ?`,
+      [REVIEW_HIGHLIGHTS_MAX]
+    );
+    rows.sort((a, b) => new Date(b.created_at) - new Date(a.created_at) || b.id - a.id);
+    res.json({
+      total: Number(total),
+      reviews: rows.map(r => ({
+        id: r.id,
+        rating: r.rating,
+        comment: r.comment,
+        verified: !!r.is_verified_purchase,
+        reviewer: reviewerShortName(r.full_name),
+        product: { id: r.product_id, name: r.product_name },
+        created_at: r.created_at,
+      })),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not fetch reviews." });
+  }
+});
+
 // The signed-in customer's own review of a product (or null), so the product page can show
 // it with an Edit option instead of a blank form. Includes `hidden`, so a moderated review
 // can be explained to its author; no other customer's data is returned.

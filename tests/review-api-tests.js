@@ -11,9 +11,12 @@
 // unknown, malformed and archived product ids → 404; a customer reads and edits their own review,
 // edits re-check verified purchase and never change moderation.
 //
-// Fixtures: eleven customers, two orders (one cancelled), and three borrowed products whose
-// avg_rating / review_count are recorded first and restored at the end; one archived product id is
-// read (never written). Everything the suite inserts is deleted in `finally`.
+// R11 (2026-11-16): GET /api/reviews/highlights — public; visible reviews with text of active products,
+// any rating; short reviewer names only; newest first; at most 24, a random set when more are eligible.
+//
+// Fixtures: thirteen customers, two orders (one cancelled), and three borrowed products whose
+// avg_rating / review_count are recorded first and restored at the end; one archived product (never
+// written itself; R11 attaches one fixture review to it). Everything the suite inserts is deleted in `finally`.
 const path = require("path"), crypto = require("crypto");
 process.chdir(process.env.SERVER_DIR || path.join(__dirname, ".."));
 const iso = require("./support/isolated-suite");
@@ -221,6 +224,52 @@ const call = async (method, url, token, body) => {
     tot = (await q("SELECT avg_rating, review_count FROM products WHERE id = ?", [P1]))[0];
     check("U7 editing a hidden review keeps it hidden: saved, still not served, still not counted",
       r.status === 200 && bRow.hidden === 1 && bRow.rating === 5 && !pubAfter.some(x => x.user_id === B) && Number(tot.avg_rating) === 1.5 && tot.review_count === 2, JSON.stringify({ bRow, tot }));
+
+    /* ---------- R11: GET /api/reviews/highlights (homepage strip, owner decisions D15) ---------- */
+    // Extra fixtures: a one-word name (through the API), a review of an archived product and a
+    // whitespace-only comment (both inserted directly — the API would refuse them — and deleted at the end).
+    const K = await mk("Kwame"), tK = tok(K);
+    r = await call("POST", `/api/products/${P3}/reviews`, tK, { rating: 4, comment: "Single-name reviewer" });
+    if (archived) await q("INSERT INTO reviews (product_id, user_id, rating, comment) VALUES (?, ?, 5, 'Review of an archived product')", [archived.id, K]);
+    await q("INSERT INTO reviews (product_id, user_id, rating, comment) VALUES (?, ?, 5, '   ')", [P1, E]);
+    const eligibleSql = `SELECT r.id FROM reviews r JOIN products p ON p.id = r.product_id AND p.deleted_at IS NULL
+                          WHERE r.hidden = 0 AND r.comment IS NOT NULL AND TRIM(r.comment) <> ''`;
+    let eligible = (await q(eligibleSql)).map(x => x.id);
+    r = await call("GET", "/api/reviews/highlights");
+    let hl = (r.data && r.data.reviews) || [];
+    const byId = Object.fromEntries(hl.map(x => [x.id, x]));
+    const aId = (await q("SELECT id FROM reviews WHERE user_id = ? AND product_id = ?", [A, P1]))[0].id;
+    const kId = (await q("SELECT id FROM reviews WHERE user_id = ? AND product_id = ?", [K, P3]))[0].id;
+    check("H1 public (no login) → 200 { total, reviews }; total = every eligible review", r.status === 200 && r.data.total === eligible.length && hl.length === Math.min(eligible.length, 24), `${r.status} total=${r.data && r.data.total} eligible=${eligible.length} returned=${hl.length}`);
+    check("H2 a 2-star review is included (no rating filter), with its short name, product and verified flag",
+      byId[aId] && byId[aId].rating === 2 && byId[aId].comment === "Grew on me less" && byId[aId].reviewer === "Ama B." && byId[aId].product.id === P1 && typeof byId[aId].product.name === "string" && byId[aId].verified === false, JSON.stringify(byId[aId]));
+    check("H3 a one-word name is shown as it is", byId[kId] && byId[kId].reviewer === "Kwame", JSON.stringify(byId[kId]));
+    const hiddenId = (await q("SELECT id FROM reviews WHERE user_id = ? AND product_id = ?", [B, P1]))[0].id;
+    const archivedId = archived ? (await q("SELECT id FROM reviews WHERE user_id = ? AND product_id = ?", [K, archived.id]))[0].id : -1;
+    const blankId = (await q("SELECT id FROM reviews WHERE user_id = ? AND product_id = ?", [E, P1]))[0].id;
+    const ratingOnly = (await q("SELECT id FROM reviews WHERE user_id IN (?) AND comment IS NULL", [users])).map(x => x.id);
+    check("H4 excluded: a hidden review, a review of an archived product, a whitespace-only comment, rating-only reviews",
+      !byId[hiddenId] && !byId[archivedId] && !byId[blankId] && ratingOnly.length >= 5 && ratingOnly.every(id => !byId[id]) && !eligible.includes(hiddenId) && !eligible.includes(archivedId),
+      JSON.stringify({ hidden: !!byId[hiddenId], archived: !!byId[archivedId], blank: !!byId[blankId], ratingOnly: ratingOnly.filter(id => byId[id]) }));
+    const keys = [...new Set(hl.flatMap(x => Object.keys(x)))].sort().join(",");
+    const productKeys = [...new Set(hl.flatMap(x => Object.keys(x.product || {})))].sort().join(",");
+    const json = JSON.stringify(r.data);
+    check("H5 only review fields: id, rating, comment, verified, short reviewer name, product {id, name}, created_at — no full names or account data",
+      keys === "comment,created_at,id,product,rating,reviewer,verified" && productKeys === "id,name" && !/Buyer|Browser|Commenter|Spaces|full_name|user_id|email|phone|hidden/i.test(json), `${keys} | ${productKeys}`);
+    check("H6 newest first", hl.every((x, i) => i === 0 || new Date(hl[i - 1].created_at) >= new Date(x.created_at)));
+
+    // Cap: 25 more reviews with text (one customer, 25 different active products) → at most 24 returned.
+    const G = await mk("Gloria Many");
+    const capProducts = await q("SELECT id FROM products WHERE deleted_at IS NULL AND id NOT IN (?) ORDER BY id LIMIT 25", [[P1, P2, P3]]);
+    for (const p of capProducts) await q("INSERT INTO reviews (product_id, user_id, rating, comment) VALUES (?, ?, 4, ?)", [p.id, G, `Cap fixture ${p.id}`]);
+    eligible = (await q(eligibleSql)).map(x => x.id);
+    r = await call("GET", "/api/reviews/highlights");
+    hl = (r.data && r.data.reviews) || [];
+    check(`H7 more than 24 eligible (${eligible.length}) → total says so, 24 returned, all eligible, no repeats, newest first`,
+      r.data.total === eligible.length && eligible.length > 24 && hl.length === 24 && hl.every(x => eligible.includes(x.id)) && new Set(hl.map(x => x.id)).size === 24 &&
+      hl.every((x, i) => i === 0 || new Date(hl[i - 1].created_at) >= new Date(x.created_at)), `total=${r.data.total} returned=${hl.length}`);
+    const seen = new Set(); for (let i = 0; i < 6; i++) ((await call("GET", "/api/reviews/highlights")).data.reviews || []).forEach(x => seen.add(x.id));
+    check("H8 with more than 24 eligible, repeated requests draw different sets (every review can appear over time)", seen.size > 24, `distinct ids over 7 requests: ${seen.size}`);
   } catch (e) {
     console.error("HARNESS ERROR:", e); results.push(false);
   } finally {
