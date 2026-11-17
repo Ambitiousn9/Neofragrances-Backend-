@@ -816,7 +816,7 @@ Dependencies & risks / Next action.
 - Dependencies & risks: migrations 002, 004, 005, 006, 007 and 009 in production.
 - Next action: Phase 5; owner decision on the remaining items.
 
-**P3.14 — R11 / SF-REV-01: continuously scrolling customer reviews (right to left)** · *NOT STARTED*
+**P3.14 — R11 / SF-REV-01: continuously scrolling customer reviews (right to left)** · *COMPLETE (Local)*
 - **Owner-approved planned feature** (storefront roadmap **R11**, recorded 2026-11-15). Not an optional suggestion.
 - Required:
   - a premium-looking, continuously moving review display;
@@ -840,19 +840,53 @@ Dependencies & risks / Next action.
   - below the owner's minimum count the display does not animate (or stays hidden, as the owner decides);
   - 320, 390 and 1366px checks: no clipping, overflow, CSP violations or console errors; guarded suite coverage
     for the new endpoint.
-- Exists:
-  - a homepage "Customer Reviews" section that shows up to 3 genuine reviews in a static grid and stays hidden
-    when there are none (`index.html:158–167`, `js/home.js:22–23` and `:323+`, data from `GET /api/products/:id/reviews`);
-  - a working right-to-left marquee pattern with reduced-motion handling, used by the brand strip
-    (`js/home.js:80–110`, `css/home.css:436–456`).
+- **Owner decisions D15 (2026-11-16):** minimum 3 eligible reviews; 0 → section hidden; 1–2 → static, no
+  animation; 3+ → continuous right-to-left scrolling at about 30 px/s; placement unchanged (homepage, between the
+  notes section and the "Shopping with NeoFragrances" service strip); every eligible visible review with text,
+  any star rating (the old 4–5 star filter removed); a visible Pause/Play control; short reviewer names built
+  on the server; hidden reviews and reviews of archived products excluded; R3's integrity rules apply.
+- Exists (2026-11-16, LOCAL, uncommitted until owner approval):
+  - **`GET /api/reviews/highlights`** (`server.js`): public; visible reviews (hidden = 0) with comment text, of
+    active products, any rating; returns `{ total, reviews: [{ id, rating, comment, verified, reviewer,
+    product { id, name }, created_at }] }` — the reviewer as a short name ("Ama B.", same format the homepage
+    always used), never the full name, user id or account data; at most 24, newest first, a random set per
+    request when more are eligible. No new table, column or migration;
+  - **homepage** (`index.html`, `js/home.js`, `css/home.css`): reviews load from that endpoint as soon as the page
+    is ready (no longer from the stored per-product review totals); 0 → hidden, 1–2 → static grid (role=list),
+    3+ → a strip reusing the brand marquee technique (two identical groups, translateX(−50%); the copy and its
+    gap-filling extras are aria-hidden with untabbable links) at 30 px/s; pauses on hover, on keyboard focus and
+    with a visible Pause/Play `<button>` (accessible name changes with its state); reduced motion → no animation,
+    no button, one swipeable row; long comments clamped to 5 lines on the card;
+  - genuine data only: nothing creates, edits or filters reviews by rating.
+- **Guarded regression with the new homepage — all green (2026-11-16/17):**
+  - first run (2026-11-16 17:51, stopped by Claude Code for low memory): scent-family-storefront-e2e 62/62,
+    restore-app-verify 34/34, offers-multi-product-tests 127/127, maintenance-tests 85/85;
+  - second run (2026-11-16 23:27–23:45, one suite at a time, evidence
+    `NeoFragrances-DB-Validation\r11-verify-20261116-232747`): account-e2e 61/61, admin-e2e 98/98,
+    scent-family-admin-e2e 47/47; e2e-checkout 25/29 then **29/29** on a single targeted re-run (the 4 failures were
+    the callback page still "Confirming your payment…" after the harness's 10 s wait while settlement finished
+    later on a loaded machine; the order itself was created correctly); account-controls-tests 86/87 (A87) and
+    order-status-history-tests 91/92 (M4), both caused by fixtures left in the test database by the stopped run;
+  - **owner-approved fixture cleanup 2026-11-17 00:27** (test database only): verified backup
+    `NeoFragrances-DB-Backups\pre-fixture-cleanup-20261117-002653` (sha256 31e08c6d…), then one transaction with an
+    identity check, re-confirmation of every fixture and its relationships, and checked deletes — order_items 4,
+    orders 3, addresses 3, password_resets 1, users 3 (#812–814, stamp `1794852474661`); baseline afterwards 1 user,
+    0 orders, 0 password resets, stock 2613, 1 review; the `users` checksum returned to its pre-incident value and no
+    other table changed;
+  - **re-runs 2026-11-17 (evidence `NeoFragrances-DB-Validation\r11-final-20261117-002810`): account-controls-tests
+    87/87 and order-status-history-tests 92/92**, no assertion changed;
+  - the working database was identical before and after every step (all 16 tables, every product's ratings, stock
+    and `updated_at`).
 - Remains:
-  - the scrolling version;
-  - a way to load every eligible review (the current section shows at most 3) and a definition of "eligible"
-    (for example: visible, not hidden by moderation);
-  - a rule for how many reviews are needed before it scrolls. Locally there is **1 visible review** (read-only
-    `SELECT`, 2026-11-14), and a marquee would repeat it;
-  - placement (homepage only, or also product pages).
-- Evidence: code references above; `SELECT COUNT(*)` on `reviews` (1 total, 1 visible).
+  - locally the working database has 1 eligible review, so the homepage shows it statically (as before); the
+    moving strip has been exercised with test data only;
+  - commit (with owner approval); production needs the server and frontend release (Phase 7).
+- Evidence: frontend `tests/home-reviews-tests.js` 23/23 (6/6 mutations caught), all frontend suites 15 files 350/350;
+  backend `tests/review-api-tests.js` H1–H8 for the endpoint, 47/47 twice (guarded, working database and its one
+  review unchanged), security-headers-tests 43/43; real-browser check under the real `_headers` CSP (canned API,
+  Netlify-like server) 42/42: thresholds 0/2/6, movement right-to-left at ≈30 px/s, two identical halves at least
+  as wide as the strip (no gap), one copy for screen readers, Pause/Play, hover and focus pause, reduced motion,
+  320/390/1366px with no overflow, CSP violations or errors.
 - Dependencies & risks:
   - the owner's rule that the homepage is enhanced, never redesigned;
   - no invented or placeholder reviews;
@@ -861,8 +895,9 @@ Dependencies & risks / Next action.
   - **review data must be genuine and reliable**: the storefront roadmap's R3 review-integrity work is
     **COMPLETE (Local)** (P1.19, 2026-11-16: one review per customer per product, 1,000-character comments,
     valid ratings only), so the moving display can draw on one review per customer;
-  - **owner decisions D15**: the minimum-review threshold and the display location both need owner confirmation.
-- Next action: owner decides the minimum review count and placement (D15), then implement (R3 is done).
+  - owner decisions D15 — **resolved 2026-11-16** (above).
+- Next action: commit with owner approval; then the release path (P6.6, Phase 7).
+- Marked COMPLETE (Local) on 2026-11-17 after every required regression check passed (owner instruction).
 
 **P3.15 — R9 / ACCT-AV-01: customer profile-picture management** · *NOT STARTED*
 - **Owner-approved planned feature** (storefront roadmap **R9**, recorded 2026-11-15). Not an optional suggestion.
@@ -925,13 +960,34 @@ Dependencies & risks / Next action.
 ### Phase 4 — Content completion
 *Objective: every customer-facing page carries real, owner-approved information.*
 
-**P4.1 — Shipping, Returns and FAQ pages** · *BLOCKED (owner facts)* — NOT STARTED
+**P4.1 — Shipping, Returns and FAQ pages (storefront roadmap R1)** · *NOT STARTED* — FAQ and No Refund Policy content received 2026-11-16, reviewed 2026-11-17; implementation awaits owner approval
 - Required: real shipping, delivery, returns and FAQ information.
-- Exists: "Coming soon" stubs of about 36 words each (`shipping.html`, `returns.html`, `FAQ.html`).
-- Remains: all the content.
-- Evidence: page text check (2026-11-14).
-- Dependencies & risks: owner-supplied facts only (section 7).
-- Next action: owner supplies the facts.
+- Exists:
+  - "Coming soon" stubs of about 36 words each (`shipping.html`, `returns.html`, `FAQ.html`);
+  - **owner content received 2026-11-16** and kept verbatim, outside the repositories, in
+    `owner-content\2026-11-16-faq.txt` and `owner-content\2026-11-16-no-refund-policy.txt` (project folder);
+  - owner rules for implementing it: the FAQ and the No Refund Policy are separate pages; every FAQ returns answer
+    must match the policy (all sales final, no refunds; exchange/replacement only for damaged or incorrect items
+    reported within 24 hours of delivery, with photo/video evidence, unused and in the original packaging); the
+    FAQ's old 7-day refund promise is dropped; nothing missing is invented.
+  - **content review done 2026-11-17** (`owner-content\2026-11-17-R1-content-review.md`, review only, no page edited):
+    - three FAQ answers conflict with the policy — "Can I return a perfume?" (7-day full refund), "What if my order
+      arrives damaged, leaking or wrong?" ("a replacement or a refund", no 24-hour limit, photo only) and "How do I
+      get a refund?" — each with proposed replacement wording;
+    - accuracy limitations: the FAQ points customers to Fragrance Notes, but only 5 of 166 active products have real
+      notes; "bank card or mobile money" depends on the Paystack account's enabled channels (not verified);
+  - **support contact details received 2026-11-17**: email Neofragrances001@gmail.com, phone/WhatsApp 0505731824 —
+    to replace the policy's placeholders when it is implemented. **Owner decision (2026-11-17):** these are used for
+    the No Refund Policy and related customer-support content only; the site-wide footer and the Contact page keep
+    Ambitiousn9@icloud.com (not replaced site-wide).
+- Remains:
+  - owner approval of the implementation scope and of the three proposed FAQ rewordings;
+  - owner confirmation of the two accuracy points (fragrance notes, payment channels);
+  - the policy's placeholders stay unpublished until implementation, then take the details above;
+  - Shipping & Delivery page: still needs owner-approved content.
+- Evidence: the files above; page text check (2026-11-14).
+- Dependencies & risks: owner-supplied facts only (section 7); P4.2 (privacy, terms) is separate.
+- Next action: owner approves the implementation scope and the FAQ returns rewording.
 
 **P4.2 — Privacy Policy and Terms of Service** · *PARTIALLY COMPLETE — BLOCKED (owner/legal)*
 - Required: complete policies covering what the site actually does.
@@ -1303,7 +1359,7 @@ Dependencies & risks / Next action.
 | B1 | Owner content (section 7) | P4.x, P3.6 | Owner |
 | B2 | Single-disk backups (P0.3) | Data safety | — |
 | D14 | Image storage for uploads (admin product images P3.13, customer profile pictures P3.15 / R9) | P3.13 image upload, P3.15 | Owner |
-| D15 | Scrolling reviews: minimum genuine-review threshold and display location (P3.14 / R11) | P3.14 | Owner |
+| D15 | ~~Scrolling reviews: minimum genuine-review threshold and display location (P3.14 / R11)~~ — **resolved 2026-11-16**: minimum 3 (0 hidden, 1–2 static, 3+ moving), existing homepage position, all ratings, visible Pause/Play | — | — |
 | D16 | ~~How the QA-001 test checkout was run (device and address) (P2.6)~~ — **resolved**: the owner confirmed an iPhone at `http://172.20.10.3:5500`; QA-001 fixed in `77c3e8b` and verified with order #527 on 2026-11-14 | — | — |
 | B3 | ~~Running local API can't be restarted from a non-elevated session (P0.6)~~ — **resolved**: the API was restarted with the LAN origin at 09:19 on 2026-11-14 and confirmed healthy at 11:43 | — | — |
 
@@ -1313,9 +1369,16 @@ Dependencies & risks / Next action.
 
 Nothing here may be invented; each item waits for the owner.
 
-- **Shipping and delivery facts** — areas, fees (the site charges a GH₵8 flat fee), timescales, couriers (P4.1).
-- **Returns policy** — conditions, window, process (P4.1).
-- **FAQ** — questions and answers (P4.1).
+- **Shipping and delivery facts** — areas, fees (the site charges a GH₵8 flat fee), timescales, couriers (P4.1). Still
+  needed for a separate Shipping & Delivery page (the FAQ mentions same-day Accra delivery before 2 PM and 2–3
+  business days nationwide).
+- **Returns policy** — **received 2026-11-16** as a No Refund Policy (`owner-content/2026-11-16-no-refund-policy.txt`).
+  Support contact details for its placeholders **received 2026-11-17**: email Neofragrances001@gmail.com,
+  phone/WhatsApp 0505731824 (`owner-content/2026-11-17-R1-content-review.md`) — for the No Refund Policy and related
+  customer-support content only; the footer and Contact page keep Ambitiousn9@icloud.com (owner decision 2026-11-17);
+  placeholders stay unpublished until the policy is implemented (P4.1).
+- **FAQ** — **received 2026-11-16** (`owner-content/2026-11-16-faq.txt`); three returns answers conflict with the
+  No Refund Policy — proposed rewording awaiting owner approval (`owner-content/2026-11-17-R1-content-review.md`) (P4.1).
 - **Privacy Policy and Terms** — full text or approval (P4.2).
 - **Product photos** for the 26 products without an image, plus licence confirmation (P3.6, P3.7).
 - **Hero image licence** (`images/hero/hero-banner.jpg`) (P3.7).
@@ -1324,7 +1387,7 @@ Nothing here may be invented; each item waits for the owner.
 - ~~**Maceration copy** for the Fragrance Guide (P4.5).~~ — **supplied and approved 2026-11-14**, with the owner's
   original maceration card; added in `a88a2b6` (P3.1, P4.5).
 - **Dark-mode design choices** (D4).
-- **Scrolling-reviews rules** — minimum genuine-review count and placement (D15, P3.14).
+- ~~**Scrolling-reviews rules** — minimum genuine-review count and placement (D15, P3.14).~~ — **decided 2026-11-16** (see P3.14).
 - **Image-storage choice** for admin and customer uploads (D14, P3.13, P3.15).
 - ~~**QA-001 details** — device, address and Paystack reference of the test checkout (D16, P2.6).~~ —
   **supplied 2026-11-14**: iPhone at `http://172.20.10.3:5500`; the retest produced order #527 (P2.6).
@@ -1396,7 +1459,7 @@ Per-suite detail: `tests/README.md` (some rows stale — P2.4).
    section once the copy is approved.~~ — **done 2026-11-15** (frontend `a88a2b6`; P3.1 and P4.5 COMPLETE (Local)).
 4. **Owner-approved planned storefront features (recorded 2026-11-15):** R9 profile pictures (P3.15, needs D14),
    R10 customer-facing light/dark mode (P3.3, needs D4; T04 dependency satisfied), R11 scrolling reviews
-   (P3.14, needs D15; the R3 review-integrity work, P1.19, is done 2026-11-16). The admin dark mode is the separate task P3.16.
+   (P3.14: D15 decided 2026-11-16; R11 COMPLETE (Local) 2026-11-17, all guarded regression green; uncommitted until owner approval). The admin dark mode is the separate task P3.16.
 5. ~~**One full guarded regression pass (P2.2)**~~ — **all 17 suites green 2026-11-15**, including the
    `e2e-checkout.js` positive run (P2.3). The rest of the `tests/README.md` clean-up (P2.4).
 6. **Documentation (Phase 6):** READMEs (P6.2), runbook into the repo (P6.4), environment document (P6.5).
